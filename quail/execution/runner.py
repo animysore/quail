@@ -79,15 +79,21 @@ class NodeMetrics:
 
 
 def scalar_node_metrics(nodes: Mapping[str, "NodeResult"]) -> dict:
-    """Return the scalar metrics of each node, keyed by node id."""
+    """Return the scalar metrics of each node, keyed by node id.
+
+    Extension metrics that are plain numbers, such as a filter's
+    borrowed_prefix_tokens, are included beside the standard fields.
+    """
     scalar_fields = tuple(
         field.name for field in fields(NodeMetrics)
         if field.name != "extension"
     )
     return {
         node_id: {
-            name: getattr(result.metrics, name)
-            for name in scalar_fields
+            **{name: getattr(result.metrics, name) for name in scalar_fields},
+            **{name: value
+               for name, value in result.metrics.extension.items()
+               if isinstance(value, (int, float)) and not isinstance(value, bool)},
         }
         for node_id, result in nodes.items()
     }

@@ -5,7 +5,7 @@ compiled graph runs.
 
 The queries are IMDB-7 (three filters over the reviews table, the
 unified attention path) and BIO-2 (the reports x terms join, the
-merge_quant attention path), at scale factor 0.1. Each run goes
+tree attention path), at scale factor 0.1. Each run goes
 through the real planner and the real worker execution core
 (quail.backends.quail.worker.execute_single); only the pipeline inside the
 worker state is swapped, so packing, admission, the join search, KV
@@ -33,7 +33,7 @@ in an Engine subclass below):
 
   quail          our fused Triton kernels (the shipping executor)
   vllm_ops       vLLM's ops called one by one, unfused, and on the
-                 merge_quant path vLLM's merge_attn_states kernel
+                 tree path vLLM's merge_attn_states kernel
                  plus a separate group-quant in place of our fused
                  merge+quant kernel
   vllm_compiled  the kernel set stock vLLM's compiled graph runs:
@@ -78,7 +78,7 @@ DATA_DIR = "/results/quailb_data"
 # query id -> (attention path of its model work, result file suffix)
 MEASURED_QUERIES = {
     "IMDB-7": ("unified", "imdb7"),
-    "BIO-2": ("merge_quant", "bio2"),
+    "BIO-2": ("tree", "bio2"),
 }
 
 
@@ -210,12 +210,12 @@ class KernelSourceEngine(Engine):
     # its eager merge kernel plus the standalone group-quant. out_b
     # covers only the rows with cached context, so those rows are
     # gathered, merged, and scattered back; the row list comes from
-    # the chunk meta stashed by attention_merge_quant below.
+    # the chunk meta stashed by attention_tree below.
 
-    def attention_merge_quant(self, q, k, v, meta):
-        cross = meta.get("cross")
-        self._merge_rows = None if cross is None else cross["rows"]
-        return super().attention_merge_quant(q, k, v, meta)
+    def attention_tree(self, q, k, v, meta):
+        reads = meta.get("reads")
+        self._merge_rows = None if reads is None else reads["rows"]
+        return super().attention_tree(q, k, v, meta)
 
     def merge_attn_quant(self, out_a, lse_a, out_b, lse_b, source):
         if self.kernel_source == "quail":

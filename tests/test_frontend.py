@@ -222,8 +222,19 @@ TWO_WHERE = """
                     {'selectivity': 0.2})
 """
 
+PAIR_JOIN_SQL = """
+    SELECT r.id, p.asin
+    FROM reviews r
+    JOIN products p
+      ON r.id = p.asin
+     AND AI_FILTER(PROMPT('Review {0} discusses product {1}',
+                          r.review, p.description),
+                   {'selectivity': 0.05})
+    WHERE AI_FILTER(PROMPT('This review is negative: {0}', r.review))
+"""
 
-def test_join_predicates_and_semantics(catalog):
+
+def test_join_predicates_semantics_and_equality_pruning(catalog):
     # a chain: each multi-table AI_FILTER is its own pairwise join
     plan = compile_sql(TWO_ONS, catalog, tok)
     outer = plan.root.input
@@ -283,20 +294,7 @@ def test_join_predicates_and_semantics(catalog):
     assert [r.alias for r in inner.prompt.args] == ["r", "p"]
     assert [r.alias for r in outer.prompt.args] == ["r", "p"]
 
-
-PAIR_JOIN_SQL = """
-    SELECT r.id, p.asin
-    FROM reviews r
-    JOIN products p
-      ON r.id = p.asin
-     AND AI_FILTER(PROMPT('Review {0} discusses product {1}',
-                          r.review, p.description),
-                   {'selectivity': 0.05})
-    WHERE AI_FILTER(PROMPT('This review is negative: {0}', r.review))
-"""
-
-
-def test_join_on_equality_prunes_the_pairs(catalog):
+    # an ON equality prunes the pairs before the AI predicate sees them
     plan = compile_sql(PAIR_JOIN_SQL, catalog, tok)
     join = plan.root.input
     assert isinstance(join, SemanticJoin)
@@ -331,51 +329,6 @@ def test_join_on_equality_prunes_the_pairs(catalog):
           AND AI_FILTER(PROMPT('This review is negative: {0}', r.review))
     """, catalog, tok)
     assert where_plan == plan
-
-
-def test_builder_rejects_invalid_queries(catalog):
-    def reviews():
-        return docs(catalog, "reviews", tok).alias("r")
-
-    def table(name, alias):
-        return docs(catalog, name, tok).alias(alias)
-
-    with pytest.raises(CompileError, match="no AI predicate"):
-        reviews().join(table("products", "p"),
-                       on=col("r.id") == col("p.asin")).select("r.id")
-    with pytest.raises(CompileError, match="must name the joined table"):
-        (reviews()
-         .ai_join(table("threads", "t"),
-                  prompt("x {0} {1}", col("r.review"), col("t.thread")))
-         .join(table("products", "p"))
-         .ai_filter(prompt("x {0} {1}", col("r.review"), col("t.thread"))))
-    with pytest.raises(CompileError, match="waiting for the ai_filter"):
-        reviews().join(table("products", "p")).join(table("threads", "t"))
-    with pytest.raises(CompileError, match="must relate the joined table"):
-        reviews().join(table("products", "p"), on=col("r.id") == col("r.review"))
-
-    q = reviews().ai_join(
-        table("threads", "b"), prompt("x {0} {1}", col("r.review"), col("b.thread")))
-    with pytest.raises(CompileError, match="joined but not referenced"):
-        q.ai_join(table("products", "p"),
-                  prompt("y {0} {1}", col("r.review"), col("b.thread")))
-    with pytest.raises(CompileError, match="at least one table"):
-        reviews().ai_join(
-            [table("threads", "b"), table("products", "p")],
-            prompt("y {0} {1}", col("b.thread"), col("p.description")))
-    with pytest.raises(CompileError):
-        docs(catalog, "reviews", tok).select("id")
-    with pytest.raises(CompileError):
-        docs(catalog, "nowhere")
-    with pytest.raises(CompileError):
-        reviews().ai_filter(prompt("x {0} {1}", col("r.review"), col("r.id")))
-
-    plan = compile_sql("SELECT r.id FROM reviews r WHERE AI_FILTER("
-                       "PROMPT('x: {0}', r.review)) LIMIT 5", catalog, tok)
-    assert plan.root.limit == 5
-    built = (reviews().ai_filter(prompt("x: {0}", col("r.review")))
-             .limit(3).select("r.id"))
-    assert built.root.limit == 3
 
 
 REJECTED = [
@@ -438,11 +391,57 @@ REJECTED = [
 ]
 
 
-@pytest.mark.parametrize("sql,fragment", REJECTED)
-def test_rejected_sql_names_the_problem(catalog, sql, fragment):
-    with pytest.raises(CompileError) as e:
-        compile_sql(sql, catalog, tok)
-    assert fragment.lower() in str(e.value).lower()
+def test_builder_and_sql_reject_invalid_queries(catalog):
+    for sql, fragment in REJECTED:
+        try:
+            compile_sql(sql, catalog, tok)
+        except CompileError as error:
+            assert fragment.lower() in str(error).lower(), sql
+        else:
+            raise AssertionError(f"compiled: {sql}")
+
+    def reviews():
+        return docs(catalog, "reviews", tok).alias("r")
+
+    def table(name, alias):
+        return docs(catalog, name, tok).alias(alias)
+
+    with pytest.raises(CompileError, match="no AI predicate"):
+        reviews().join(table("products", "p"),
+                       on=col("r.id") == col("p.asin")).select("r.id")
+    with pytest.raises(CompileError, match="must name the joined table"):
+        (reviews()
+         .ai_join(table("threads", "t"),
+                  prompt("x {0} {1}", col("r.review"), col("t.thread")))
+         .join(table("products", "p"))
+         .ai_filter(prompt("x {0} {1}", col("r.review"), col("t.thread"))))
+    with pytest.raises(CompileError, match="waiting for the ai_filter"):
+        reviews().join(table("products", "p")).join(table("threads", "t"))
+    with pytest.raises(CompileError, match="must relate the joined table"):
+        reviews().join(table("products", "p"), on=col("r.id") == col("r.review"))
+
+    q = reviews().ai_join(
+        table("threads", "b"), prompt("x {0} {1}", col("r.review"), col("b.thread")))
+    with pytest.raises(CompileError, match="joined but not referenced"):
+        q.ai_join(table("products", "p"),
+                  prompt("y {0} {1}", col("r.review"), col("b.thread")))
+    with pytest.raises(CompileError, match="at least one table"):
+        reviews().ai_join(
+            [table("threads", "b"), table("products", "p")],
+            prompt("y {0} {1}", col("b.thread"), col("p.description")))
+    with pytest.raises(CompileError):
+        docs(catalog, "reviews", tok).select("id")
+    with pytest.raises(CompileError):
+        docs(catalog, "nowhere")
+    with pytest.raises(CompileError):
+        reviews().ai_filter(prompt("x {0} {1}", col("r.review"), col("r.id")))
+
+    plan = compile_sql("SELECT r.id FROM reviews r WHERE AI_FILTER("
+                       "PROMPT('x: {0}', r.review)) LIMIT 5", catalog, tok)
+    assert plan.root.limit == 5
+    built = (reviews().ai_filter(prompt("x: {0}", col("r.review")))
+             .limit(3).select("r.id"))
+    assert built.root.limit == 3
 
 
 def test_builder_places_apply_nodes_in_the_logical_tree():

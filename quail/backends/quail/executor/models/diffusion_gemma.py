@@ -51,9 +51,9 @@ class DiffusionGemmaPipeline(ModelPipeline):
     """
 
     needs_pages = True
-    # every chunk runs one causal call; the two-call join path writes
+    # every chunk runs one causal call; the tree path's merge writes
     # the engine's fp8 GEMM inputs, which this model does not use
-    join_attention = "unified"
+    tree_attention = False
     gemm_warmup = False
     # Partial join batches also need compiled expert kernels at these sizes.
     warm_tokens = ModelPipeline.warm_tokens + (4096, 8192, 16384, 32768)

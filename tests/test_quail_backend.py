@@ -161,7 +161,7 @@ def _ids(tables):
     return tables[alias].column(alias).to_pylist()
 
 
-def test_pair_join_runs_through_the_quail_graph(monkeypatch):
+def test_pair_join_and_gpu_timing_run_through_the_quail_graph(monkeypatch):
     # document d has key d % 4; partners 0 and 3 share key 0, so a
     # document with key 0 pairs with both and one with key 3 with none
     columns = _key_columns([d % 4 for d in range(14)], [0, 1, 2, 0])
@@ -201,6 +201,25 @@ def test_pair_join_runs_through_the_quail_graph(monkeypatch):
         root = result["_outputs"][PortRef("group:0", "ids:r")]
         assert sorted(root.column("r").to_pylist()) == kept
 
+    # GPU timing sums the chunk events only when asked
+    off, _, _, _ = run_graph_on_arena(
+        monkeypatch, two_alias_graph(True), pages=48)
+    assert "gpu_s" not in off
+    assert all(metrics["gpu_s"] == 0.0
+               for metrics in off["node_metrics"].values())
+    on, model, _, _ = run_graph_on_arena(
+        monkeypatch, two_alias_graph(True), pages=48, gpu_timing=True)
+    # join chunks run before the streamed filter chain finishes
+    kinds = [kind for kind, _ in model.launched]
+    assert kinds.index("join") < len(kinds) - 1 - kinds[::-1].index("filter")
+    # the fake torch reports 2 ms per event pair, one pair per chunk
+    per_node = [metrics["gpu_s"] for metrics in on["node_metrics"].values()]
+    assert on["gpu_s"] == pytest.approx(sum(per_node), abs=1e-3)
+    assert on["gpu_s"] > 0
+    assert on["chunks"] == round(on["gpu_s"] / 0.002)
+    assert all(chunks == round(chunks)
+               for chunks in (seconds / 0.002 for seconds in per_node))
+
 
 def _foreign_run(monkeypatch, graph, functions):
     # document d has key d % 4; partner i has key i
@@ -211,7 +230,7 @@ def _foreign_run(monkeypatch, graph, functions):
     return result, survivors, join_truth
 
 
-def test_foreign_runs_per_batch_on_the_stream_and_once_as_a_barrier(monkeypatch):
+def test_foreign_runs_per_batch_or_once_as_a_barrier_and_are_checked(monkeypatch):
     functions = {"keep_even": keep_even, "same_key": same_key}
     # a per-batch drop on the pinned chain: only even survivors reach the join
     result, survivors, join_truth = _foreign_run(
@@ -252,35 +271,13 @@ def test_foreign_runs_per_batch_on_the_stream_and_once_as_a_barrier(monkeypatch)
         assert result["node_metrics"]["apply:same_key"]["output_rows"] == len(
             survivors)
 
-
-@pytest.mark.parametrize("kind, ids, function, message", [
-    ("per_batch", "drop", lambda tables: [99], "never invents an id"),
-    ("barrier", "preserve", lambda tables: _ids(tables)[1:],
-     "preserves ids but dropped"),
-    ("barrier", "drop", lambda tables: [None] + _ids(tables)[1:],
-     "returned a null id"),
-])
-def test_foreign_results_are_checked(monkeypatch, kind, ids, function, message):
-    graph = two_alias_graph(kind == "per_batch", foreign=(kind, ids))
-    with pytest.raises(ValueError, match=message):
-        _foreign_run(monkeypatch, graph, {"keep_even": function})
-
-
-def test_gpu_timing_sums_the_chunk_events_only_when_asked(monkeypatch):
-    off, _, _, _ = run_graph_on_arena(
-        monkeypatch, two_alias_graph(True), pages=48)
-    assert "gpu_s" not in off
-    assert all(metrics["gpu_s"] == 0.0
-               for metrics in off["node_metrics"].values())
-    on, model, _, _ = run_graph_on_arena(
-        monkeypatch, two_alias_graph(True), pages=48, gpu_timing=True)
-    # join chunks run before the streamed filter chain finishes
-    kinds = [kind for kind, _ in model.launched]
-    assert kinds.index("join") < len(kinds) - 1 - kinds[::-1].index("filter")
-    # the fake torch reports 2 ms per event pair, one pair per chunk
-    per_node = [metrics["gpu_s"] for metrics in on["node_metrics"].values()]
-    assert on["gpu_s"] == pytest.approx(sum(per_node), abs=1e-3)
-    assert on["gpu_s"] > 0
-    assert on["chunks"] == round(on["gpu_s"] / 0.002)
-    assert all(chunks == round(chunks)
-               for chunks in (seconds / 0.002 for seconds in per_node))
+    for kind, ids, function, message in [
+        ("per_batch", "drop", lambda tables: [99], "never invents an id"),
+        ("barrier", "preserve", lambda tables: _ids(tables)[1:],
+         "preserves ids but dropped"),
+        ("barrier", "drop", lambda tables: [None] + _ids(tables)[1:],
+         "returned a null id"),
+    ]:
+        graph = two_alias_graph(kind == "per_batch", foreign=(kind, ids))
+        with pytest.raises(ValueError, match=message):
+            _foreign_run(monkeypatch, graph, {"keep_even": function})

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import time
 from collections.abc import Mapping
 from dataclasses import replace
 from typing import Any
@@ -14,7 +15,7 @@ from quail.backends.quail.graph import filter_result, stage_partner_lists
 from quail.backends.quail.worker import execute_quail_request, prepare_quail_request
 from quail.execution.reranker import RerankerModelExecution
 from quail.execution.runner import NodeMetrics, NodeResult, SurvivorStream
-from quail.execution.tokens import DocumentKeys
+from quail.execution.tokens import DocumentKeys, prefix_tree
 from quail.logical import Alias, is_score, shared_preamble
 from quail.logical.prompts import true_false_token_ids
 from quail.physical import (
@@ -33,6 +34,7 @@ from quail.planner.physical_optimizer import (
 )
 from quail.planner.plan import Refusal
 from quail.planner.reranker import plan_reranker
+from quail.progress import logger
 
 
 class QuailModelExecution:
@@ -136,6 +138,10 @@ class QuailModelExecution:
             retain_survivors = inputs.get("retain_survivors", ())
             if retain_survivors is False:
                 retain_survivors = ()
+            # sorted admission would change which rows a limit keeps
+            tree = (None if inputs.get("limit") is not None
+                    else _prefix_tree(node, inputs["documents"], arena))
+            stats = {}
             answers, spans, tokens = loop.run_filter(
                 torch,
                 arena,
@@ -149,11 +155,15 @@ class QuailModelExecution:
                 arena_keys=DocumentKeys(node.alias, document_ids),
                 retain_survivors=retain_survivors,
                 document_done=inputs.get("document_done"),
+                prefix_tree=tree,
+                attention_mode=node.attention or None,
+                stats=stats,
             )
             return filter_result(
                 node, answers, tokens, document_ids,
                 gpu_s=_gpu_seconds(torch, spans, inputs),
-                chunks=_chunks(spans, inputs))
+                chunks=_chunks(spans, inputs),
+                borrowed_tokens=stats.get("borrowed_tokens", 0))
 
         stage_frames = inputs["stage_frames"]
         stream = inputs.get("anchor_stream")
@@ -176,8 +186,12 @@ class QuailModelExecution:
                 hold_survivors=True,
                 hold_extra_tokens=filter_node.hold_tokens,
                 document_done=stream.get("document_done"),
+                prefix_tree=_prefix_tree(
+                    filter_node, stream["documents"], arena),
+                attention_mode=filter_node.attention or None,
             )
         lists_for = inputs.get("anchor_partners")
+        join_stats = {}
         answers, spans, tokens = loop.run_join(
             torch,
             arena,
@@ -193,6 +207,10 @@ class QuailModelExecution:
             anchor_partners=(
                 None if lists_for is None else lambda key: lists_for(key[1])),
             anchor_batch=inputs.get("anchor_batch"),
+            attention_mode=node.attention or None,
+            prefix_tree=(None if source is not None else _prefix_tree(
+                node, inputs["prefixes"], arena)),
+            stats=join_stats,
         )
         if source is not None:
             # admission order; a per-batch function may have dropped some
@@ -252,9 +270,27 @@ class QuailModelExecution:
                 fresh_tokens=tokens,
                 gpu_s=_gpu_seconds(torch, spans, inputs),
                 chunks=_chunks(spans, inputs),
-                extension={"answers": answers},
+                extension={
+                    "answers": answers,
+                    **({"borrowed_prefix_tokens": join_stats["borrowed_tokens"]}
+                       if join_stats.get("borrowed_tokens") else {}),
+                },
             ),
         )
+
+
+def _prefix_tree(node, documents, arena):
+    """The node's prefix tree, or None when the plan did not ask for one."""
+    if not node.share_prefixes:
+        return None
+    started = time.perf_counter()
+    tree = prefix_tree(documents, arena.page_tokens)
+    logger.info(
+        "prefix sharing on %s: %s documents borrow %s tokens "
+        "(tree built in %.2f s)", getattr(node, "alias", None) or node.anchor,
+        len(documents),
+        tree.shared_tokens, time.perf_counter() - started)
+    return tree
 
 
 def _gpu_seconds(torch, spans, inputs) -> float:

@@ -24,7 +24,7 @@ def allocate(arena, key, tokens):
     arena._capacity_rows[key] = None
 
 
-def test_eviction_is_reported_to_the_answer_sink():
+def test_retention_priority_capacity_eviction_and_its_report():
     seen = []
     set_answer_sink(seen.append)
     try:
@@ -37,8 +37,6 @@ def test_eviction_is_reported_to_the_answer_sink():
         set_answer_sink(None)
     assert seen == [{"kind": "evict", "alias": "a", "document": 1, "tokens": 32}]
 
-
-def test_retention_priority_capacity_and_eviction():
     arena = cpu_arena(16, 4, {'early': (1, 0), 'later': (1, 1)})
     allocate(arena, ('later', 0), 32)
     arena.retain(('later', 0), 32)

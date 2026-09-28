@@ -140,8 +140,13 @@ def stage_partner_lists(group, lists_for, anchor_ids) -> list:
 
 
 def filter_result(node, answers, tokens, document_ids,
-                  gpu_s: float = 0.0, chunks: int = 0) -> NodeResult:
-    """Build one filter chain's node result from its local answers."""
+                  gpu_s: float = 0.0, chunks: int = 0,
+                  borrowed_tokens: int = 0) -> NodeResult:
+    """Build one filter chain's node result from its local answers.
+
+    borrowed_tokens are document tokens read from another document's
+    KV pages instead of computed (prefix sharing).
+    """
     global_answers = {
         document_ids[int(local)]: row
         for local, row in answers.items()
@@ -163,6 +168,8 @@ def filter_result(node, answers, tokens, document_ids,
             fresh_tokens=tokens,
             gpu_s=gpu_s,
             chunks=chunks,
+            extension=({"borrowed_prefix_tokens": borrowed_tokens}
+                       if borrowed_tokens else {}),
         ),
     )
 

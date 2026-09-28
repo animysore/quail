@@ -176,6 +176,41 @@ def _attention_time(model: ModelSpec, device: DeviceSpec,
                moved / device.hbm_bw) * model.layers
 
 
+def choose_attention_path(model: ModelSpec, device: DeviceSpec, *,
+                          readers: float, reader_rows: float,
+                          node_tokens: float) -> str:
+    """Pick "unified" or "tree" attention for readers of one shared node.
+
+    The node is a join's anchor or a filter's parent document; its
+    readers are the partners or the children borrowing its pages.
+
+    Under unified attention every reader reads the node's KV itself.
+    Under tree attention the readers' rows are stacked into one read of
+    the node, then merged with each reader's attention over its own
+    rows. Both times take the larger of compute and memory, so tree
+    wins only for readers that are memory-bound on the node: few rows
+    each, many of them.
+
+    Args:
+        model: The model whose attention runs.
+        device: The device it runs on.
+        readers: Readers sharing the node in one forward pass.
+        reader_rows: Query rows per reader.
+        node_tokens: KV tokens of the shared node.
+    """
+    if readers <= 1 or reader_rows <= 0 or node_tokens <= 0:
+        return "unified"
+    unified = readers * _attention_time(model, device, reader_rows,
+                                        node_tokens)
+    rows = readers * reader_rows
+    tree = _attention_time(model, device, rows, node_tokens)
+    # the merge kernel reads two partial outputs and writes one, in
+    # bf16, once per layer
+    merge = 3 * rows * model.n_q * model.d_head * ACT_BYTES / device.hbm_bw
+    tree += merge * model.layers
+    return "tree" if tree < unified else "unified"
+
+
 def attention_crossover(model: ModelSpec, device: DeviceSpec,
                         chunk_tokens: int | None = None) -> float:
     """Document length (tokens) where attention overtakes dense projections.

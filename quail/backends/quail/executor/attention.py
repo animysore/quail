@@ -4,7 +4,7 @@ DeepGEMM matmuls, fused Triton kernels, FlashAttention varlen
 self-attention, paged cross-attention against the arena, and
 softmax-state merge.
 
-Two attention paths: merge_quant (two attention calls merged with a fused
+Two attention paths: tree (two attention calls merged with a fused
 kernel) and unified (one causal paged attention call after scattering
 current KV into the arena). A chunk with no arena pages skips the
 arena and runs one causal varlen call per group.
@@ -32,11 +32,14 @@ GROUP = 128            # fp8 quant group size, matches the engine
 # whose Hopper build takes heads up to 512, over arena pages.
 FA_MAX_HEAD_DIM = 256
 
-# Filters run "unified" (one causal paged attention call); a join's
-# chunks run the path the model pipeline names, "merge_quant" (two
-# calls with the fused merge+quant kernel) for the fp8 Qwen3 models.
-FILTER_ATTENTION = "unified"
-JOIN_ATTENTION = "merge_quant"
+# The two attention paths a chunk can run. "unified" is one causal
+# paged call in which every row reads the KV its own document needs.
+# "tree" is two calls: a causal one over the chunk's rows and one in
+# which the readers of one resident KV (a join anchor, a shared
+# prefix) read it stacked, merged by the fused merge+quant kernel.
+# The tree path needs the fp8 kernels, so only pipelines that set
+# tree_attention run it.
+ATTENTION_PATHS = ("unified", "tree")
 
 
 @dataclass
@@ -49,8 +52,8 @@ class Chunk:
         final_indices: Rows whose hidden state feeds the answer readout.
         meta: Attention-path bookkeeping built by pack_chunk: the layer
             counter, KV scatter maps, block tables, and sequence bounds.
-        attention_mode: "unified" or "merge_quant", the path the
-            packer laid the chunk out for.
+        attention_mode: "unified" or "tree", the path the packer laid
+            the chunk out for.
         tokens: Rows in the chunk.
         layout: (arena key, suffix count) per group in chunk order.
         temporary_keys: Arena keys the loop frees after the forward pass.
@@ -788,10 +791,10 @@ class Engine:
         q3 = q.view(n, H, D)
         k3 = k.view(n, KH, D)
         v3 = v.contiguous().view(n, KH, D)
-        if chunk.attention_mode == "merge_quant":
+        if chunk.attention_mode == "tree":
             if not self.is_fp8:
                 raise ValueError("BF16 forward passes require unified attention")
-            return self.attention_merge_quant(q3, k3, v3, chunk.meta)
+            return self.attention_tree(q3, k3, v3, chunk.meta)
         return self.quant(self.attention_unified(q3, k3, v3, chunk.meta))
 
     # ---- attention: the two workload paths --------------------------
@@ -829,8 +832,8 @@ class Engine:
             version=4 if wide else None)
         return out
 
-    def attention_merge_quant(self, q3, k3, v3, meta):
-        """The two-call attention path with the fused merge plus FP8 quantize.
+    def attention_tree(self, q3, k3, v3, meta):
+        """The tree attention path: two calls, fused merge plus FP8 quantize.
 
         Takes (rows, heads, dim) tensors and returns the input pair
         for o_proj. Canvas rows are not packed for this path.
@@ -847,22 +850,22 @@ class Engine:
         out_a, lse_a = self._fa(
             q3, k3, v3, meta["cu_a"], meta["cu_a"],
             meta["max_a"], meta["max_a"], causal=True)
-        cross = meta["cross"]
-        if cross is None:
+        reads = meta["reads"]
+        if reads is None:
             meta["layer"] += 1
             return self.quant(out_a.view(n, H * D))
 
-        rows = cross["rows"]
-        q_suf = q3.index_select(0, rows)
+        rows = reads["rows"]
+        q_readers = q3.index_select(0, rows)
         kp, vp = self.arena.paged_kv(layer)
         out_b, lse_b = self._fa(
-            q_suf, kp, vp, cross["cu_q"], None,
-            cross["max_q"], cross["max_used"], causal=False,
-            block_table=cross["table"], seqused_k=cross["used"])
+            q_readers, kp, vp, reads["cu_q"], None,
+            reads["max_q"], reads["max_used"], causal=False,
+            block_table=reads["table"], seqused_k=reads["used"])
         lse_a = lse_a.transpose(0, 1)
         lse_b = lse_b.transpose(0, 1)
         q_out, scales = self.merge_attn_quant(
-            out_a, lse_a, out_b, lse_b, cross["source"])
+            out_a, lse_a, out_b, lse_b, reads["source"])
         meta["layer"] += 1
         return q_out, scales
 

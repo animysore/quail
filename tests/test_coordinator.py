@@ -32,7 +32,7 @@ def filter_node():
                     question_token_ids=((7, 7),))
 
 
-def test_filter_round_split_merge_and_limit():
+def test_filter_and_join_rounds_split_and_place_documents():
     # LIMIT counts output rows: with joins, cutting survivors drops rows (#39)
     p = payload()
     p["filter_limit"] = 3
@@ -62,8 +62,6 @@ def test_filter_round_split_merge_and_limit():
     limited = merge_filter_round(outs, limit=3)
     assert limited["survivors"]["r"] == [0, 1, 3]
 
-
-def test_join_distribution_and_kv_placement():
     # an anchor that ran no filter round has no KV to stay near: its scan
     # shard is ignored and shards balance over the live documents
     p = payload()
@@ -111,7 +109,7 @@ def test_join_distribution_and_kv_placement():
     assert len(assigned) == len(set(assigned))
 
 
-def test_join_merge_gates_and_live_rows():
+def test_join_merge_gates_thins_and_ships_partner_lists():
     out = dict(rows={0: [1, 0], 1: [0, 0], 2: [0, 1]},
                anchor_index=[5, 7, 9])
     assert gate_group(out, "full") == [5, 9]
@@ -151,8 +149,6 @@ def test_join_merge_gates_and_live_rows():
     assert merged[1]["rows"] == {0: [0, 1, 1], 2: [1, 0, 0]}
     assert merged[1]["partner_index"] == [[0], [1], [2]]
 
-
-def test_coordinator_ships_and_merges_per_anchor_partner_lists():
     outs = [
         dict(joins=[dict(rows={0: [1], 1: [0, 1]}, anchor_index=[0, 4],
                          partner_index=[[1], [2], [3]],

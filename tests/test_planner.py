@@ -208,32 +208,33 @@ def test_filter_ordering_and_kv_writes(catalog):
     assert "selectivity 0.2" in plan.settings["order_source"]
 
 
-@pytest.mark.parametrize("sels,expected", [
+ROW_ESTIMATES = [
     ((0.5, 0.25), "12.5"), ((1.0, 0.0), "0"),
     ((None, 0.5), "10"), ((None, 0.0), "0"),
-])
-def test_explain_row_estimates_and_verbose_fields(catalog, sels, expected):
-    logical = _five_filter_plan(catalog, sels)
-    plan = _plan(logical, {"r": [400] * 100})
-    text = explain(logical, plan)
-    physical = text.split("physical:", 1)[1]
-    assert _cell(physical, "Project: r.id") == [expected]
-    assert _cell(physical, "AiFilter: r")[0] == expected
-    assert _cell(physical, "AiFilter: r")[-1] in ("ms", "s")
-    assert _cell(physical, "Scan reviews as r") == ["100"]
-    assert "tokens=40,000" in physical
-    assert "node_id=" not in text and "arena_writes" not in text
-    assert "KV=bf16, chunk budget=" in text and "KV rewind=on" in text
-    for stage in filter_chain(plan).stages:
-        predicate = logical.root.input.predicates[stage.written_pos]
-        assert (f"predicate {stage.written_pos + 1}  "
-                f"PROMPT({predicate.prompt.template!r})") in physical
-    verbose = explain(logical, plan, verbose=True)
-    assert "node_id=ai_filter:r" in verbose
-    assert "admission_tokens=" in verbose and "expected_docs=" in verbose
+]
 
 
-def test_explain_limit_caps_the_row_estimate(catalog):
+def test_explain_row_estimates_limits_and_verbose_fields(catalog):
+    for sels, expected in ROW_ESTIMATES:
+        logical = _five_filter_plan(catalog, sels)
+        plan = _plan(logical, {"r": [400] * 100})
+        text = explain(logical, plan)
+        physical = text.split("physical:", 1)[1]
+        assert _cell(physical, "Project: r.id") == [expected], sels
+        assert _cell(physical, "AiFilter: r")[0] == expected, sels
+        assert _cell(physical, "AiFilter: r")[-1] in ("ms", "s"), sels
+        assert _cell(physical, "Scan reviews as r") == ["100"], sels
+        assert "tokens=40,000" in physical, sels
+        assert "node_id=" not in text and "arena_writes" not in text, sels
+        assert "KV=bf16, chunk budget=" in text and "KV rewind=on" in text, sels
+        for stage in filter_chain(plan).stages:
+            predicate = logical.root.input.predicates[stage.written_pos]
+            assert (f"predicate {stage.written_pos + 1}  "
+                    f"PROMPT({predicate.prompt.template!r})") in physical, sels
+        verbose = explain(logical, plan, verbose=True)
+        assert "node_id=ai_filter:r" in verbose, sels
+        assert "admission_tokens=" in verbose and "expected_docs=" in verbose, sels
+
     logical = _five_filter_plan(catalog, (0.25,))
     logical = replace(logical, root=replace(logical.root, limit=10))
     plan = _plan(logical, {"r": [400] * 100})
@@ -243,12 +244,36 @@ def test_explain_limit_caps_the_row_estimate(catalog):
     assert "KV: not stored" in physical
 
 
-def test_component_costs_and_model_weights():
+def mask_pairs(prefix, suffix, window):
+    """Count allowed keys for every new query position."""
+    return sum(1 for q in range(prefix, prefix + suffix) for k in range(q + 1)
+               if not window or q - k < window)
+
+
+def test_work_matches_attention_masks_and_component_costs():
     from quail.cost.dense_decoder_cost import (
         dense_decoder_components,
         dense_params,
     )
     from quail.specs import DIFFUSION_GEMMA_26B_FP8
+
+    for window, prefix, suffix in ((0, 2, 4), (1, 9, 3), (4, 0, 3),
+                                  (4, 2, 4), (4, 4, 1), (4, 9, 3)):
+        first = scan(prefix, suffix, window=window)
+        continuation = ask(prefix, suffix, window=window)
+        assert first.pairs == mask_pairs(0, prefix + suffix, 0)
+        assert continuation.pairs == mask_pairs(prefix, suffix, 0)
+        assert first.sliding_pairs == (
+            mask_pairs(0, prefix + suffix, window) if window else 0)
+        assert continuation.sliding_pairs == (
+            mask_pairs(prefix, suffix, window) if window else 0)
+        assert continuation.sliding_kv_read == (
+            min(prefix, window - 1) if window else 0)
+        branches = stream(prefix, [suffix, suffix + 1], window=window)
+        assert branches.sliding_pairs == (
+            sum(mask_pairs(prefix, s, window) for s in (suffix, suffix + 1))
+            if window else 0)
+        assert branches.sliding_kv_read == continuation.sliding_kv_read
 
     work = ask(400, 50) * 1000
     result = speed_of_light(work, QWEN3_4B_FP8, H100_SXM, 110_376)
@@ -281,7 +306,20 @@ def test_component_costs_and_model_weights():
     assert not work.dominates(replace(work, sliding_kv_read=1022))
 
 
-def test_join_anchors_groups_and_forced_order(catalog):
+def _chain(catalog, sels=(0.1, 0.1), anchors=(None, None)):
+    return (docs(catalog, "reviews", tok).alias("r")
+            .ai_join(docs(catalog, "threads", tok).alias("t"),
+                     prompt("m1 {0} {1}", col("r.review"),
+                            col("t.thread")),
+                     selectivity=sels[0], anchor=anchors[0])
+            .ai_join(docs(catalog, "products", tok).alias("p"),
+                     prompt("m2 {0} {1}", col("t.thread"),
+                            col("p.description")),
+                     selectivity=sels[1], anchor=anchors[1])
+            .select("r.id", "t.id", "p.asin"))
+
+
+def test_join_anchors_groups_forced_order_and_later_kv_reuse(catalog):
     logical = (docs(catalog, "reviews", tok).alias("r")
                .ai_join([docs(catalog, "products", tok).alias("p"),
                          docs(catalog, "threads", tok).alias("t")],
@@ -332,21 +370,6 @@ def test_join_anchors_groups_and_forced_order(catalog):
     assert join_stages(same)[0]["anchor"] == "r"
     assert not any("prices lower" in r for r in same.remarks)
 
-
-def _chain(catalog, sels=(0.1, 0.1), anchors=(None, None)):
-    return (docs(catalog, "reviews", tok).alias("r")
-            .ai_join(docs(catalog, "threads", tok).alias("t"),
-                     prompt("m1 {0} {1}", col("r.review"),
-                            col("t.thread")),
-                     selectivity=sels[0], anchor=anchors[0])
-            .ai_join(docs(catalog, "products", tok).alias("p"),
-                     prompt("m2 {0} {1}", col("t.thread"),
-                            col("p.description")),
-                     selectivity=sels[1], anchor=anchors[1])
-            .select("r.id", "t.id", "p.asin"))
-
-
-def test_selective_gates_and_later_kv_reuse(catalog):
     # by_cost runs the cheap .01 exists gate before the .9 full join
     logical = (docs(catalog, "reviews", tok).alias("r")
                .ai_join(docs(catalog, "products", tok).alias("p"),
@@ -374,8 +397,22 @@ def test_selective_gates_and_later_kv_reuse(catalog):
     assert groups[1].anchor_resident == "kept"
 
 
-def test_retention_search_matches_enumeration():
-    from quail.planner.joins import search_joins, summarize_alias, walk
+def _join_search_spec(position, aliases, anchor):
+    return dict(
+        written_pos=position, aliases=list(aliases), anchor=anchor,
+        anchor_free=False, semantics="full", selectivity=None,
+        frame_tokens={alias: 5 for alias in aliases},
+        label_tokens={alias: 4 for alias in aliases}, tail_tokens=6)
+
+
+def test_join_search_matches_enumeration_and_tracks_residency():
+    from quail.planner.joins import (
+        AliasStats,
+        anchor_fits,
+        search_joins,
+        summarize_alias,
+        walk,
+    )
 
     specs = [{"written_pos": index, "aliases": list(aliases),
               "anchor": aliases[0], "anchor_free": True, "semantics": "full",
@@ -405,18 +442,6 @@ def test_retention_search_matches_enumeration():
             costs.append(speed_of_light(work, QWEN3_4B_FP8, H100_SXM, 8192).seconds)
     assert speed_of_light(
         result["work"], QWEN3_4B_FP8, H100_SXM, 8192).seconds == min(costs)
-
-
-def _join_search_spec(position, aliases, anchor):
-    return dict(
-        written_pos=position, aliases=list(aliases), anchor=anchor,
-        anchor_free=False, semantics="full", selectivity=None,
-        frame_tokens={alias: 5 for alias in aliases},
-        label_tokens={alias: 4 for alias in aliases}, tail_tokens=6)
-
-
-def test_join_search_residency_and_replanning():
-    from quail.planner.joins import AliasStats, anchor_fits, search_joins
 
     specs = [
         _join_search_spec(0, ("a", "b"), "a"),
@@ -489,7 +514,7 @@ def _apply_query(session, kind):
             .select("c.id", "e.id"))
 
 
-def test_planner_places_foreign_nodes_and_keeps_or_drops_the_stream():
+def test_foreign_node_placement_and_pinned_edge_validation():
     # claims are the long side, so the planner anchors on them
     with _claims_session() as session:
         per_batch = _apply_query(session, "per_batch").plan()
@@ -523,8 +548,6 @@ def test_planner_places_foreign_nodes_and_keeps_or_drops_the_stream():
         assert isinstance(plan, Refusal)
         assert plan.constraint == "apply_needs_quail_backend"
 
-
-def test_stream_validator_refuses_a_barrier_on_a_pinned_edge():
     validate_streams(two_alias_graph(True, foreign=("per_batch", "drop")))
     validate_streams(two_alias_graph(True, foreign=("per_batch", "pairs")))
     with pytest.raises(GraphValidationError, match="per-batch apply"):
@@ -609,27 +632,91 @@ def test_node_ids_estimates_and_the_recompute_column(catalog):
     assert moved.graph.node("ai_filter:r").pin_survivors
 
 
-def mask_pairs(prefix, suffix, window):
-    """Count allowed keys for every new query position."""
-    return sum(1 for q in range(prefix, prefix + suffix) for k in range(q + 1)
-               if not window or q - k < window)
+def _int_tokens(text):
+    return [int(t) for t in text.split()]
 
 
-def test_work_matches_attention_masks():
-    for window, prefix, suffix in ((0, 2, 4), (1, 9, 3), (4, 0, 3),
-                                  (4, 2, 4), (4, 4, 1), (4, 9, 3)):
-        first = scan(prefix, suffix, window=window)
-        continuation = ask(prefix, suffix, window=window)
-        assert first.pairs == mask_pairs(0, prefix + suffix, 0)
-        assert continuation.pairs == mask_pairs(prefix, suffix, 0)
-        assert first.sliding_pairs == (
-            mask_pairs(0, prefix + suffix, window) if window else 0)
-        assert continuation.sliding_pairs == (
-            mask_pairs(prefix, suffix, window) if window else 0)
-        assert continuation.sliding_kv_read == (
-            min(prefix, window - 1) if window else 0)
-        branches = stream(prefix, [suffix, suffix + 1], window=window)
-        assert branches.sliding_pairs == (
-            sum(mask_pairs(prefix, s, window) for s in (suffix, suffix + 1))
-            if window else 0)
-        assert branches.sliding_kv_read == continuation.sliding_kv_read
+def _token_store(path, bodies):
+    from quail.execution.tokens import TokenStore
+
+    schema = pa.schema({"body": pa.string()})
+    return TokenStore.write(
+        str(path), [pa.record_batch([bodies], schema=schema)],
+        document_column="body", tokenizer=_int_tokens, token_type=pa.int32())
+
+
+def test_prefix_sharing_and_attention_path_follow_the_token_store(
+        catalog, tmp_path):
+    from quail.planner.physical_rules import (
+        page_aligned_shared_tokens,
+        sharing_pays,
+    )
+
+    shared = " ".join(str(i) for i in range(40))
+    store = _token_store(tmp_path / "shared.arrow",
+                         [shared, shared + " 99 98", "7 7 7"])
+    assert page_aligned_shared_tokens(store) == 32
+    plain = _token_store(tmp_path / "plain.arrow", ["1 2 3", "4 5 6"])
+
+    logical = docs(catalog, "reviews", tok).alias("r").ai_filter(
+        prompt("flag: {0}", col("r.review")), selectivity=0.5).select("r.id")
+
+    plan = _plan(logical, {"r": store.lengths})
+    chain = filter_chain(plan)
+    assert chain.share_prefixes and chain.arena_writes
+    assert "physical rule prefix_sharing changed the plan" in plan.remarks
+    assert "share_prefixes=True" in explain(logical, plan, verbose=True)
+
+    plan = _plan(logical, {"r": plain.lengths})
+    chain = filter_chain(plan)
+    assert not chain.share_prefixes and not chain.arena_writes
+
+    # one shared page in 20,000 tokens saves less forward-pass time
+    # than writing KV pages for every token costs (about 1.2% on
+    # Qwen3 4B and an H100), so the filter stays unpaged
+    body = " ".join(str(i) for i in range(10_000))
+    little = _token_store(
+        tmp_path / "little.arrow",
+        [body, " ".join(str(i) for i in range(16)) + " 5"])
+    assert page_aligned_shared_tokens(little) == 16
+    assert not filter_chain(_plan(logical, {"r": little.lengths})).share_prefixes
+    # a filter that already writes pages shares any whole page
+    assert sharing_pays(QWEN3_4B_FP8, H100_SXM, shared_tokens=16,
+                        total_tokens=10_017, writes_pages=True)
+
+    # 40 records of 8 own tokens after a 2,048-token header: many
+    # short readers of one long node, where stacking their reads wins
+    header = " ".join(str(i) for i in range(2048))
+    records = [header + " " + " ".join([str(9000 + r)] * 8) for r in range(40)]
+    store = _token_store(tmp_path / "records.arrow", records)
+    # a chain of snapshots each 3,000 tokens longer than the last: one
+    # reader per node with more rows than the node saves
+    snapshots = [" ".join(str(i) for i in range(3000 * (k + 1)))
+                 for k in range(4)]
+    chain = _token_store(tmp_path / "chain.arrow", snapshots)
+    plan = _plan(logical, {"r": store.lengths})
+    node = filter_chain(plan)
+    assert node.share_prefixes and node.attention == "tree"
+    assert "attention=tree" in explain(logical, plan, verbose=True)
+    plan = _plan(logical, {"r": chain.lengths})
+    node = filter_chain(plan)
+    assert node.share_prefixes and node.attention == "unified"
+    # a filter without shared prefixes has one reader per node
+    plan = _plan(logical, {"r": [40, 42, 3]})
+    assert filter_chain(plan).attention == "unified"
+
+    shared = " ".join(str(i) for i in range(400))
+    reviews = _token_store(tmp_path / "anchors.arrow",
+                           [shared + f" {9000 + r}" for r in range(20)])
+    logical = (docs(catalog, "reviews", tok).alias("r")
+               .ai_join(docs(catalog, "products", tok).alias("p"),
+                        prompt("m {0} {1}", col("r.review"),
+                               col("p.description")),
+                        selectivity=0.5, anchor="r")
+               .select("r.id", "p.asin"))
+    plan = _plan(logical, {"r": reviews.lengths, "p": [20] * 20})
+    join = plan.graph.nodes_by_type(AiJoin.type_name)[0]
+    assert join.share_prefixes
+    # anchors with nothing in common share nothing
+    plan = _plan(logical, {"r": [401] * 20, "p": [20] * 20})
+    assert not plan.graph.nodes_by_type(AiJoin.type_name)[0].share_prefixes

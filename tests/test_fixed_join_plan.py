@@ -1,7 +1,6 @@
 """Fixed join execution, filter retention, and answer reconstruction."""
 
 import pyarrow as pa
-import pytest
 from test_quail_backend import graph_state
 
 import quail
@@ -180,77 +179,40 @@ def fever_executor(session, monkeypatch, gpus, check=None, capacity=1,
     return execute
 
 
-@pytest.mark.parametrize("gpus,capacity,empty,estimate", [
+FEV9_RUNS = [
     (1, 10, False, 0.001), (1, 1, False, 1.0), (1, 0, False, 0.5),
     (1, 0, True, 1.0), (2, 1, False, None),
-])
-def test_fev9_executes_bound_join_nodes_without_the_optimizer(
-        monkeypatch, gpus, capacity, empty, estimate):
-    if estimate is not None:
-        monkeypatch.setitem(FILTER_SELECTIVITY_ESTIMATES, prompts.F11, estimate)
-        monkeypatch.setitem(FILTER_SELECTIVITY_ESTIMATES, prompts.F13, estimate)
+]
 
+REQUEST_BACKENDS = ["stock_vllm", "pipelined_vllm", "pipelined_sglang"]
+
+
+def test_fev9_executes_bound_and_edited_join_nodes_without_the_optimizer(
+        monkeypatch):
     def unexpected_search(*args, **kwargs):
         raise AssertionError("execution called the join optimizer")
 
-    def check(request, graph):
-        assert sum(len(group.stages)
-                   for group in graph.nodes_by_type(AiJoin.type_name)) == 3
-        monkeypatch.setattr("quail.planner.joins.search_joins", unexpected_search)
-        return {}
+    for gpus, capacity, empty, estimate in FEV9_RUNS:
+        case = f"gpus={gpus} capacity={capacity} empty={empty}"
+        with monkeypatch.context() as patch:
+            if estimate is not None:
+                patch.setitem(FILTER_SELECTIVITY_ESTIMATES, prompts.F11, estimate)
+                patch.setitem(FILTER_SELECTIVITY_ESTIMATES, prompts.F13, estimate)
 
-    with _session(gpus=gpus) as session:
-        query = quailb.queries(session)["FEV-9"][1]()
-        execute = fever_executor(session, monkeypatch, gpus, check, capacity, empty)
-        result = execute_query(query, physical_executor=execute).collect()
-    assert result.to_pylist() == ([] if empty else FEV9_ROWS)
+            def check(request, graph):
+                assert sum(len(group.stages)
+                           for group in graph.nodes_by_type(AiJoin.type_name)) == 3
+                patch.setattr("quail.planner.joins.search_joins",
+                              unexpected_search)
+                return {}
 
+            with _session(gpus=gpus) as session:
+                query = quailb.queries(session)["FEV-9"][1]()
+                execute = fever_executor(
+                    session, patch, gpus, check, capacity, empty)
+                result = execute_query(query, physical_executor=execute).collect()
+        assert result.to_pylist() == ([] if empty else FEV9_ROWS), case
 
-@pytest.mark.parametrize("backend", [
-    "stock_vllm", "pipelined_vllm", "pipelined_sglang",
-])
-def test_request_backends_plan_fev9_and_a_single_join(backend):
-    with _session(backend=backend) as session:
-        plan = quailb.queries(session)["FEV-9"][1]().plan()
-        execution = next(node for node in plan.nodes if hasattr(node, "joins"))
-        assert execution.filters[-1].alias == execution.joins[0].anchor
-        plan = (session.docs("claims").alias("c")
-                .ai_join(session.docs("evidence").alias("e"),
-                         quail.prompt("m {0} {1}", quail.col("c.claim"),
-                                      quail.col("e.text")))
-                .select("c.id", "e.id")).plan()
-    sink = next(node for node in plan.nodes if isinstance(node, Project))
-    assert sink.inputs[0].source.port == "join_answers:0"
-
-
-def test_fev10_asks_the_model_about_same_page_pairs_only(monkeypatch):
-    def check(request, graph):
-        columns = request.column_tables()
-        assert columns["c"].column("evidence_wiki_url").to_pylist() == [
-            "e0", "e0", "e2"]
-        return {"columns": columns}
-
-    for gpus in (1, 2):
-        with _session(gpus=gpus) as session:
-            query = quailb.queries(session)["FEV-10"][1]()
-            plan = query.plan()
-            (stage,) = plan.graph.nodes_by_type(AiJoin.type_name)[0].stages
-            hash_join = plan.graph.node("hash_join:c-e")
-            assert hash_join.on == (("evidence_wiki_url", "id"),)
-            assert hash_join.pair_fraction == 3 / 9
-            assert stage.pairs_from == "hash_join:c-e"
-            result = execute_query(
-                query, physical_executor=fever_executor(session, monkeypatch, gpus,
-                                                        check))
-            # of the same-page pairs (c0, e0) and (c1, e0), only c0 is
-            # supported; a cross join would also have returned (c1, e1)
-            answers = result.answer_tables["joins"][0]
-            assert sorted(zip(answers.column("c").to_pylist(),
-                              answers.column("e").to_pylist())) == [(0, 0), (1, 0)]
-            assert result.collect().to_pylist() == [{"c.id": "c0", "e.id": "e0"}]
-
-
-def test_an_edited_fev9_plan_executes(monkeypatch):
     with _session() as session:
         query = quailb.queries(session)["FEV-9"][1]()
         plan = query.plan()
@@ -279,3 +241,47 @@ def test_an_edited_fev9_plan_executes(monkeypatch):
         assert f"barrier:{chain.alias}" in seen[1]
         assert f"barrier:{chain.alias}" not in seen[0]
         assert edited_result.collect().to_pylist() == rows.to_pylist() == FEV9_ROWS
+
+
+def test_request_backends_plan_fev9_and_a_single_join():
+    for backend in REQUEST_BACKENDS:
+        with _session(backend=backend) as session:
+            plan = quailb.queries(session)["FEV-9"][1]().plan()
+            execution = next(
+                node for node in plan.nodes if hasattr(node, "joins"))
+            assert execution.filters[-1].alias == execution.joins[0].anchor, \
+                backend
+            plan = (session.docs("claims").alias("c")
+                    .ai_join(session.docs("evidence").alias("e"),
+                             quail.prompt("m {0} {1}", quail.col("c.claim"),
+                                          quail.col("e.text")))
+                    .select("c.id", "e.id")).plan()
+        sink = next(node for node in plan.nodes if isinstance(node, Project))
+        assert sink.inputs[0].source.port == "join_answers:0", backend
+
+
+def test_fev10_asks_the_model_about_same_page_pairs_only(monkeypatch):
+    def check(request, graph):
+        columns = request.column_tables()
+        assert columns["c"].column("evidence_wiki_url").to_pylist() == [
+            "e0", "e0", "e2"]
+        return {"columns": columns}
+
+    for gpus in (1, 2):
+        with _session(gpus=gpus) as session:
+            query = quailb.queries(session)["FEV-10"][1]()
+            plan = query.plan()
+            (stage,) = plan.graph.nodes_by_type(AiJoin.type_name)[0].stages
+            hash_join = plan.graph.node("hash_join:c-e")
+            assert hash_join.on == (("evidence_wiki_url", "id"),)
+            assert hash_join.pair_fraction == 3 / 9
+            assert stage.pairs_from == "hash_join:c-e"
+            result = execute_query(
+                query, physical_executor=fever_executor(session, monkeypatch, gpus,
+                                                        check))
+            # of the same-page pairs (c0, e0) and (c1, e0), only c0 is
+            # supported; a cross join would also have returned (c1, e1)
+            answers = result.answer_tables["joins"][0]
+            assert sorted(zip(answers.column("c").to_pylist(),
+                              answers.column("e").to_pylist())) == [(0, 0), (1, 0)]
+            assert result.collect().to_pylist() == [{"c.id": "c0", "e.id": "e0"}]

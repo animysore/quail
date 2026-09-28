@@ -49,7 +49,7 @@ def _count(registry):
     return rewritten.nodes[0].n_docs
 
 
-def test_extension_order_and_nested_registration(monkeypatch):
+def test_extension_order_nesting_and_rollback(monkeypatch):
     def register(registry):
         assert "double" in registry.physical_rules
         registry.register_physical_rule(ChangeCount("add_three", offset=3))
@@ -78,12 +78,13 @@ def test_extension_order_and_nested_registration(monkeypatch):
 
     outer = _module(monkeypatch, "test_outer_extension", register_outer)
     registry = built_in_registry().load_extension(outer)
-    assert list(registry.physical_rules) == ["before", "inner", "after"]
+    built_in = list(built_in_registry().physical_rules)
+    assert [name for name in registry.physical_rules
+            if name not in built_in] == ["before", "inner", "after"]
     assert registry.extension_modules == (outer.__name__, inner.__name__)
     assert calls == ["outer", "inner"]
 
-
-def test_failed_extension_registration_rolls_back(monkeypatch):
+    # a failed registration rolls the registry back
     registry = built_in_registry().register_physical_rule(ChangeCount("existing"))
 
     def register(registry):
@@ -93,13 +94,16 @@ def test_failed_extension_registration_rolls_back(monkeypatch):
     module = _module(monkeypatch, "test_failed_extension", register)
     with pytest.raises(ValueError, match="duplicate physical_rule"):
         registry.load_extension(module)
-    assert list(registry.physical_rules) == ["existing"]
+    built_in = list(built_in_registry().physical_rules)
+    assert [name for name in registry.physical_rules
+            if name not in built_in] == ["existing"]
     assert registry.extension_modules == ()
 
     module.register_quail_extension = (
         lambda registry: registry.register_physical_rule(ChangeCount("added")))
     registry.load_extension(module)
-    assert list(registry.physical_rules) == ["existing", "added"]
+    assert [name for name in registry.physical_rules
+            if name not in built_in] == ["existing", "added"]
 
     def recursive(registry):
         registry.register_physical_rule(ChangeCount("added"))
@@ -109,7 +113,7 @@ def test_failed_extension_registration_rolls_back(monkeypatch):
     registry = built_in_registry()
     with pytest.raises(ValueError, match="duplicate extension module"):
         registry.load_extension(module)
-    assert not registry.physical_rules
+    assert list(registry.physical_rules) == built_in
     assert not registry.extension_modules
 
 

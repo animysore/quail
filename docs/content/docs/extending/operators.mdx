@@ -110,6 +110,25 @@ to TRUE/FALSE.
 selects one. For example, a rule could fuse consecutive classify
 operators.
 
+Rules run in this order:
+
+- Logical rules run in registration order, with built-in rules first.
+  Quail repeats the sequence until a pass leaves the plan unchanged
+  or it has run four passes (`MAX_PASSES`).
+- Physical rules run once per pass: `prefix_sharing`, then
+  `tree_attention`, then extension rules in registration order.
+- If the plan was built while tokenization was running, Quail runs
+  the physical rules again once the tokens are available. Return
+  `None` when your rule has no change to make. A repeated pass should
+  not duplicate a change already present in the plan.
+
+Repeated rule application is an established optimizer design.
+[DataFusion](https://datafusion.apache.org/library-user-guide/query-optimizer.html)
+also supports repeated logical optimization passes.
+[Spark's rule executor](https://github.com/apache/spark/blob/master/sql/catalyst/src/main/scala/org/apache/spark/sql/catalyst/rules/RuleExecutor.scala)
+organizes rules into batches that run once or repeat until the plan
+stops changing or a configured limit is reached.
+
 See
 [`quail/planner/logical_optimizer.py`](https://github.com/fsdatalab/quail/blob/main/quail/planner/logical_optimizer.py)
 and

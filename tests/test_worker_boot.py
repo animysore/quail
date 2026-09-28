@@ -96,7 +96,7 @@ def test_prepared_boot_is_handed_to_the_query_and_used_once(
     assert resized == [((8, 2), {"free_resident": True})]
 
 
-def test_release_booted_models_clears_state_and_cuda_cache(monkeypatch):
+def test_release_clears_cuda_state_and_a_new_model_boot_triggers_it(monkeypatch):
     calls = []
     cuda = SimpleNamespace(
         is_available=lambda: True,
@@ -120,8 +120,7 @@ def test_release_booted_models_clears_state_and_cuda_cache(monkeypatch):
     assert result == {"models_released": 1, "vllm_parallel_state_released": True,
                       "cuda_allocated_bytes": 123, "cuda_reserved_bytes": 456}
 
-
-def test_booting_a_different_model_releases_the_loaded_one(monkeypatch):
+    # booting a different model releases the loaded one
     calls = []
     monkeypatch.setattr(
         worker, "release_booted_models",

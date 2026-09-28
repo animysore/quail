@@ -47,7 +47,7 @@ def test_backup_is_a_complete_copy_including_the_wal(tmp_path):
     reopened.close()
 
 
-def test_checkpoint_copies_after_writes_and_survives_a_failing_commit(
+def test_checkpoint_copies_after_writes_syncs_now_and_survives_failing_commits(
         tmp_path, caplog):
     store = Store(tmp_path / "live" / "quail.sqlite3")
     commits = []
@@ -82,10 +82,9 @@ def test_checkpoint_copies_after_writes_and_survives_a_failing_commit(
     store.close()
     assert not checkpoint.run_once()
 
-
-def test_sync_copies_every_write_now_and_raises_when_the_commit_fails(tmp_path):
-    store = Store(tmp_path / "live" / "quail.sqlite3")
-    copy = tmp_path / "volume" / "quail.sqlite3"
+    # sync copies every write now and raises when the commit fails
+    store = Store(tmp_path / "synced" / "quail.sqlite3")
+    copy = tmp_path / "synced-volume" / "quail.sqlite3"
     failures = []
 
     def commit():

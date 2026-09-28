@@ -84,7 +84,7 @@ class _FakeFilterEngine:
         )]
 
 
-def test_filter_pipelining_advances_and_refills():
+def test_filter_chains_pipeline_refill_fail_and_take_empty_input():
     engine = _FakeFilterEngine()
     result = run_filter_chain(
         engine,
@@ -146,8 +146,7 @@ def test_filter_pipelining_advances_and_refills():
 
     asyncio.run(run())
 
-
-def test_async_filter_failure_and_empty_input():
+    # a failed request cancels the rest; no documents means no requests
     async def run():
         pending = asyncio.Event()
         cancelled = asyncio.Event()

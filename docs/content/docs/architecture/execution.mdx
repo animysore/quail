@@ -46,6 +46,24 @@ token budget and a KV page budget.
   own question tokens. A document that fails (returns FALSE) or
   won't be used again in the query has all its KV freed.
 
+### Prefix sharing
+
+Quail uses **prefix caching** to avoid recomputing identical beginnings
+of documents. For example, agent traces saved after successive turns
+repeat earlier turns. Quail can reuse KV for those repeated tokens.
+
+- The planner enables caching automatically when its estimated compute
+  savings exceed the extra cost of writing KV.
+- Filters share document prefixes. Joins share prefixes between anchors.
+  Reuse is limited to documents on the same GPU.
+- If the needed KV is unavailable, Quail computes the tokens again.
+  Filters executing with a row limit skip sharing to preserve row order.
+
+See the [prefix caching design](/docs/architecture/prefix-caching)
+for the data structure, example, and precedents, and
+[Planning](/docs/architecture/planning#deciding-whether-to-share-prefixes)
+for the cost comparison.
+
 ### Join execution
 
 Recall from [Planning](/docs/architecture/planning#deciding-join-order-and-anchors)
@@ -91,13 +109,36 @@ model layer. For each layer:
 2. **QKV projection** via DeepGEMM (FP8 matrix multiply).
 3. **QK-norm and RoPE** to produce query and key vectors.
 4. **Attention** over the new tokens and any resident KV in the
-   arena. Filters use a single causal paged attention call. Joins
-   use two calls (one for self-attention among new tokens, one for
-   cross-attention into the anchor's KV) merged with a fused
-   log-sum-exp kernel. We will describe the two attention paths in
-   detail in an upcoming technical report.
+   arena, by one of the two [attention paths](#attention-paths).
 5. **Output projection** via DeepGEMM.
 6. **MLP** (gate-up projection, SiLU activation, down projection).
+
+### Attention paths
+
+Several documents can attend to the same KV. In a join, each partner
+attends to the anchor. With prefix caching, each document attends
+to the prefix supplied by its parent.
+
+- **Unified attention** uses one call. Each document attends to its
+  prefix and its new tokens as a separate sequence.
+- **Tree attention** uses two calls. One handles attention to the
+  shared prefix, grouping documents that read the same KV. The other
+  handles attention to each document's own tokens. A GPU kernel
+  combines the results.
+
+Grouping reads can reduce memory traffic for shared KV. It also adds
+a call and a merge step, so it is not always faster. Actual memory
+reads depend on the attention kernel; grouping does not guarantee
+that each KV value is read from GPU memory only once.
+
+The planner enables the tree path only for models with FP8 weights
+and no canvas tokens, the extra rows used by DiffusionGemma. Other
+models use unified attention. See the
+[attention cost comparison](/docs/architecture/planning#choosing-the-attention-path).
+
+The `tree` attention path is a choice of attention computation.
+SGLang's RadixAttention names a prefix caching mechanism; it is not
+another name for this path.
 
 Quail uses vLLM's model implementation and DeepGEMM for the main
 matrix multiplications, but writes its own Triton JIT kernels to

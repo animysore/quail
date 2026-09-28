@@ -33,7 +33,7 @@ def _tok(text):
     return [ord(c) for c in text]
 
 
-def test_spec_geometry_budgets_and_moe_costs():
+def test_spec_geometry_budgets_costs_and_turn_text():
     shapes = SPEC.kv_shapes
     assert len(shapes) == 30
     assert [i for i, s in enumerate(shapes) if s == (2, 512)] == [5, 11, 17, 23, 29]
@@ -56,8 +56,7 @@ def test_spec_geometry_budgets_and_moe_costs():
     assert mlp_params(SPEC) == 30 * 3 * 2816 * (2112 + 8 * 704)
     assert mlp_weight_params(SPEC) == 30 * 3 * 2816 * (2112 + 128 * 704)
 
-
-def test_turn_text_wraps_filter_and_join_prompts():
+    # the chat turn wraps filter and join prompts
     turn = ("<bos><|turn>user\n", "<turn|>\n<|turn>model\n")
     ref = SimpleNamespace(alias="d")
     prompt = bind_prompt("Is {0} about food?", (ref,), _tok, turn=turn)
@@ -82,7 +81,8 @@ def test_turn_text_wraps_filter_and_join_prompts():
     assert ids[-len(_tok(join.tail)):] == _tok(join.tail)
 
 
-def test_filter_stream_charges_canvas_rows():
+def test_canvas_rows_are_charged_in_filter_streams_and_packed_chunks(
+        monkeypatch):
     pipeline = fake_pipeline(canvas_ids=(1, 2, 3))
     answers = SimpleNamespace(submit=lambda v: v, result=lambda v: v, dtype=None)
     docs = [[5] * 20, [6] * 30]
@@ -108,10 +108,9 @@ def test_filter_stream_charges_canvas_rows():
         200, arena_writes=False, arena_keys=[("d", 0)])
     assert stream.arena_writes
     assert arena.retention_cap_pages == 8
-    assert stream.sched.free_pages is not None
+    assert stream.sched.pages
 
-
-def test_pack_chunk_appends_canvas_rows_after_each_suffix(monkeypatch):
+    # pack_chunk appends the canvas rows after each suffix
     torch = cpu_staging(monkeypatch)
     arena = cpu_arena(64)
     canvas = (90, 91, 92, 93)
@@ -142,7 +141,7 @@ def test_pack_chunk_appends_canvas_rows_after_each_suffix(monkeypatch):
     assert plain.meta["canvas"] is None
     assert plain.final_indices.tolist() == [4, 7]
     with pytest.raises(ValueError, match="unified"):
-        loop.pack_chunk(torch, arena, groups, attention_mode="merge_quant",
+        loop.pack_chunk(torch, arena, groups, attention_mode="tree",
                         canvas=canvas)
 
 
@@ -283,7 +282,7 @@ def _fake_model(torch, hidden=4):
         quail_vllm_config="config")
 
 
-def test_pipeline_runs_the_gemma4_layer_order(monkeypatch):
+def test_pipeline_layer_order_and_one_row_canvas_attention(monkeypatch):
     torch = pytest.importorskip("torch")
     seen = _vllm_stubs(monkeypatch)
     model = _fake_model(torch)
@@ -301,7 +300,7 @@ def test_pipeline_runs_the_gemma4_layer_order(monkeypatch):
             _fake_model(torch), None, engine_class=_Engine,
             spec=_spec_for(_fake_model(torch), sliding_window=512))
     assert seen["workspace"] == "cuda"
-    assert pipeline.join_attention == "unified" and not pipeline.gemm_warmup
+    assert not pipeline.tree_attention and not pipeline.gemm_warmup
     assert pipeline.max_chunk_tokens == (2**31 - 1) // 32
 
     rows = torch.tensor([3, 4, 5])
@@ -320,6 +319,35 @@ def test_pipeline_runs_the_gemma4_layer_order(monkeypatch):
     assert out.tolist() == [[3.0] * 4, [3.0] * 4]
     DiffusionGemmaPipeline(model, None, spec=spec, engine_class=_Engine)
     assert model.model.layers[1].post_feedforward_layernorm.weight.item() == 0.5
+
+    # a one-row canvas skips the second attention call
+    from quail.backends.quail.executor.attention import Engine
+
+    cpu_staging(monkeypatch)
+    for canvas, calls in [((90,), 1), ((90, 91), 2)]:
+        arena = cpu_arena(64)
+        groups = [dict(key=("d", 0), prefix=[1, 2, 3], f=3, suffixes=[[10, 11]])]
+        chunk = loop.pack_chunk(torch, arena, groups, attention_mode="unified",
+                                canvas=canvas)
+        engine = Engine.__new__(Engine)
+        engine.arena = arena
+        engine.torch = torch
+        seen = []
+
+        def fa(q, k, v, cu_q, cu_k, max_q, max_k, causal, **kwargs):
+            seen.append((q.shape[0], causal))
+            return torch.zeros(q.shape[0], 2, 4), None
+
+        monkeypatch.setattr(engine, "_fa", fa)
+        rows = chunk.tokens
+        q3 = torch.zeros(rows, 2, 4)
+        meta = dict(chunk.meta, layer=0)
+        out = engine.attention_unified(q3, q3, q3, meta)
+        assert out.shape == (rows, 8), canvas
+        assert len(seen) == calls, canvas
+        assert seen[0] == (rows, True), canvas
+        if calls == 2:
+            assert seen[1] == (len(canvas), False)
 
 
 def _vllm_stubs(monkeypatch):
@@ -367,36 +395,3 @@ def test_tuned_moe_configs_merge_upstream_or_fall_back(tmp_path):
         (folder / name).write_text("{}")
     write_configs(folder, tmp_path / "missing")
     assert list(folder.glob("*.json")) == []
-
-
-@pytest.mark.parametrize("canvas, calls", [((90,), 1), ((90, 91), 2)])
-def test_one_row_canvas_skips_the_second_attention_call(
-        monkeypatch, canvas, calls):
-    import torch
-
-    from quail.backends.quail.executor.attention import Engine
-
-    cpu_staging(monkeypatch)
-    arena = cpu_arena(64)
-    groups = [dict(key=("d", 0), prefix=[1, 2, 3], f=3, suffixes=[[10, 11]])]
-    chunk = loop.pack_chunk(torch, arena, groups, attention_mode="unified",
-                            canvas=canvas)
-    engine = Engine.__new__(Engine)
-    engine.arena = arena
-    engine.torch = torch
-    seen = []
-
-    def fa(q, k, v, cu_q, cu_k, max_q, max_k, causal, **kwargs):
-        seen.append((q.shape[0], causal))
-        return torch.zeros(q.shape[0], 2, 4), None
-
-    monkeypatch.setattr(engine, "_fa", fa)
-    rows = chunk.tokens
-    q3 = torch.zeros(rows, 2, 4)
-    meta = dict(chunk.meta, layer=0)
-    out = engine.attention_unified(q3, q3, q3, meta)
-    assert out.shape == (rows, 8)
-    assert len(seen) == calls
-    assert seen[0] == (rows, True)
-    if calls == 2:
-        assert seen[1] == (len(canvas), False)

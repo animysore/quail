@@ -58,7 +58,8 @@ def test_create_saves_a_complete_snapshot_and_client_ids_return_it_or_conflict(
     assert store.find("nope") is None
 
 
-def test_discard_and_cancel_close_queued_records_and_flag_started_ones(store):
+def test_discard_cancel_and_epoch_updates_change_records_and_notify(
+        store):
     queued = create(store, query_id="q")
     assert store.discard(queued.id)
     assert store.find("q") is None
@@ -84,9 +85,7 @@ def test_discard_and_cancel_close_queued_records_and_flag_started_ones(store):
                         error={"type": "Cancelled", "message": "stopped"})
     assert store.request_cancel(running.id).state == "cancelled"
 
-
-def test_updates_bump_revisions_notify_listeners_and_only_the_current_epoch_writes(
-        store):
+    # updates bump revisions, notify listeners, and only the current epoch writes
     status = create(store)
     calls = []
 

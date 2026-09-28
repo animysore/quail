@@ -103,7 +103,8 @@ def test_uploads_are_checked_and_saved_once(make_client):
     assert server.store.get_input(content_id).byte_count == len(payload)
 
 
-def test_capabilities_submission_validation_and_client_query_ids(make_client):
+def test_capabilities_submission_validation_client_ids_and_hf_inputs(
+        make_client, monkeypatch):
     client = make_client()
     capabilities = client.get("/v1/capabilities").json()
     assert capabilities["models"] == ["qwen3-4b-fp8"]
@@ -155,31 +156,30 @@ def test_capabilities_submission_validation_and_client_query_ids(make_client):
     all_queries = client.get("/v1/queries", params={"limit": "all"}).json()
     assert {item["id"] for item in all_queries["queries"]} == {"k", other["id"]}
 
+    # a Hugging Face input is resolved without a download
+    from quail.catalog import HuggingFaceProvider
 
-def test_a_submission_is_made_durable_before_it_is_acknowledged(make_client):
-    client = make_client()
-    server = client.app.state.server
-    server.scheduler.stop()
-    content_id = upload(client)
-    synced = []
-    server.add_sync(lambda: synced.append(server.store.list_recent()[0].id))
-    accepted = client.post("/v1/queries", json=submission(content_id, query_id="d"))
-    assert accepted.status_code == 201
-    assert synced == ["d"], "the sync ran after the record was saved"
-    client.post("/v1/queries", json=submission(content_id, query_id="d"))
-    assert synced == ["d"], "a repeated submission does not sync again"
+    calls = []
 
-    def failing_sync():
-        raise OSError("volume commit failed")
+    def fake_from_hf(dataset, id_col, split="train", config="", revision=""):
+        calls.append((dataset, revision))
+        return HuggingFaceProvider(
+            dataset, id_col=id_col, split=split, config=config,
+            revision=revision,
+            arrow_schema=pa.schema([("id", pa.string()), ("review", pa.string())]))
 
-    server.add_sync(failing_sync)
-    refused = client.post("/v1/queries", json=submission(content_id, query_id="e"))
-    assert_error(refused, 500, "volume commit failed")
-    assert client.get("/v1/queries/e").status_code == 404, "no record was kept"
-    assert client.get("/v1/queries/d").status_code == 200
+    monkeypatch.setattr(inputs.DocumentProvider, "from_hf",
+                        staticmethod(fake_from_hf))
+    body = submission("unused", inputs={"reviews": {
+        "kind": "hf", "dataset": "org/reviews", "config": "", "split": "train",
+        "revision": "abc123", "id_col": "id"}})
+    response = client.post("/v1/queries", json=body)
+    assert response.status_code == 201, response.text
+    assert calls == [("org/reviews", "abc123")]
+    assert wait_done(client, response.json()["id"])["state"] == "failed"
 
 
-def test_lifecycle_over_http_with_long_poll_events_and_files(make_client):
+def test_http_lifecycle_events_files_and_durable_submissions(make_client):
     client = make_client()
     server = client.app.state.server
     server.scheduler.stop()
@@ -241,6 +241,25 @@ def test_lifecycle_over_http_with_long_poll_events_and_files(make_client):
     assert time.monotonic() - started < 15, "a long poll returns on a change"
     wait_done(client, fresh["id"])
 
+    # a submission is made durable before it is acknowledged
+    server.scheduler.stop()
+    synced = []
+    server.add_sync(lambda: synced.append(server.store.list_recent()[0].id))
+    accepted = client.post("/v1/queries", json=submission(content_id, query_id="d"))
+    assert accepted.status_code == 201
+    assert synced == ["d"], "the sync ran after the record was saved"
+    client.post("/v1/queries", json=submission(content_id, query_id="d"))
+    assert synced == ["d"], "a repeated submission does not sync again"
+
+    def failing_sync():
+        raise OSError("volume commit failed")
+
+    server.add_sync(failing_sync)
+    refused = client.post("/v1/queries", json=submission(content_id, query_id="e"))
+    assert_error(refused, 500, "volume commit failed")
+    assert client.get("/v1/queries/e").status_code == 404, "no record was kept"
+    assert client.get("/v1/queries/d").status_code == 200
+
 
 def test_bearer_token_guards_the_api_but_not_the_page(make_client):
     client = make_client(token="secret")
@@ -253,25 +272,3 @@ def test_bearer_token_guards_the_api_but_not_the_page(make_client):
     assert client.get("/queries").status_code == 200
 
 
-def test_hf_inputs_are_resolved_without_download(make_client, monkeypatch):
-    from quail.catalog import HuggingFaceProvider
-
-    client = make_client()
-    calls = []
-
-    def fake_from_hf(dataset, id_col, split="train", config="", revision=""):
-        calls.append((dataset, revision))
-        return HuggingFaceProvider(
-            dataset, id_col=id_col, split=split, config=config,
-            revision=revision,
-            arrow_schema=pa.schema([("id", pa.string()), ("review", pa.string())]))
-
-    monkeypatch.setattr(inputs.DocumentProvider, "from_hf",
-                        staticmethod(fake_from_hf))
-    body = submission("unused", inputs={"reviews": {
-        "kind": "hf", "dataset": "org/reviews", "config": "", "split": "train",
-        "revision": "abc123", "id_col": "id"}})
-    response = client.post("/v1/queries", json=body)
-    assert response.status_code == 201, response.text
-    assert calls == [("org/reviews", "abc123")]
-    assert wait_done(client, response.json()["id"])["state"] == "failed"

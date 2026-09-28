@@ -12,13 +12,11 @@ from quail.backends.request import RequestBackend
 from quail.specs import H100_SXM, MODELS, QWEN3_4B_FP8, QWEN3_RERANKER_0_6B_BF16
 
 
-def test_quail_backend_supports_every_registered_model():
+def test_backends_support_registered_generative_models_and_refuse_others():
     for model in MODELS.values():
         assert model.arch in supported_archs()
         assert QuailBackend().supports(model, H100_SXM, 1).supported
 
-
-def test_unknown_architecture_is_refused_before_loading():
     spec = replace(QWEN3_4B_FP8, name="other", arch="other")
     with pytest.raises(ValueError, match="other"):
         build_pipeline(spec, model=None, arena=None)
@@ -26,8 +24,6 @@ def test_unknown_architecture_is_refused_before_loading():
     assert not support.supported
     assert "other" in support.reason
 
-
-def test_request_backends_serve_generative_models_only():
     engine = SimpleNamespace(label="stock vLLM", kind="vllm")
     backend = RequestBackend(name="stock", engine=engine, filter_submission="operator")
     assert backend.supports(QWEN3_4B_FP8, H100_SXM, 1).supported
@@ -46,18 +42,17 @@ def _model(torch, dtype):
         layers=[layer], embed_tokens=None, norm=None))
 
 
-@pytest.mark.parametrize("dtype_name, expected", [
-    ("float8_e4m3fn", "merge_quant"), ("bfloat16", "unified")])
-def test_join_attention_follows_the_weight_precision(dtype_name, expected):
+def test_tree_attention_follows_the_weight_precision():
     torch = pytest.importorskip("torch")
-    engines = []
+    for dtype_name, expected in [("float8_e4m3fn", True), ("bfloat16", False)]:
+        engines = []
 
-    def engine(arena, **kwargs):
-        engines.append(kwargs)
-        return SimpleNamespace(**kwargs)
+        def engine(arena, **kwargs):
+            engines.append(kwargs)
+            return SimpleNamespace(**kwargs)
 
-    pipeline = Qwen3Pipeline(_model(torch, getattr(torch, dtype_name)), None,
-                             spec=None, engine_class=engine)
-    assert engines[0]["fp8"] is (expected == "merge_quant")
-    assert pipeline.join_attention == expected
-    assert pipeline.max_chunk_tokens == (2**31 - 1) // 4096
+        pipeline = Qwen3Pipeline(_model(torch, getattr(torch, dtype_name)), None,
+                                 spec=None, engine_class=engine)
+        assert engines[0]["fp8"] is expected, dtype_name
+        assert pipeline.tree_attention is expected, dtype_name
+        assert pipeline.max_chunk_tokens == (2**31 - 1) // 4096, dtype_name

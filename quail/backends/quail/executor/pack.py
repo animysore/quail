@@ -117,6 +117,98 @@ def pages_for(tokens: int, page_tokens: int) -> int:
 _DONE = -2      # the anchor's last stage answered, or it failed a gate
 
 
+def partner_pages(page_cost, page_tokens, prefix_tokens, frame_tokens,
+                  suffix_rows):
+    """Temporary pages one partner's rows take on the unified path.
+
+    They follow the anchor's last partial page, whose rows are copied
+    in first.
+    """
+    return page_cost((prefix_tokens + frame_tokens) % page_tokens
+                     + suffix_rows, 0)
+
+
+class Borrowing:
+    """Which parent each document borrows its KV prefix from, as admitted.
+
+    The prefix tree names each document's parent and shared tokens.
+    decide() makes the choice when the document is admitted: wait
+    while the parent is still queued, borrow the parent's first shared
+    tokens, or pack the whole document when the arena cannot serve the
+    borrow (the parent has left, or trimmed its window below the
+    shared tokens) or the parent never runs (see skip()). record()
+    keeps the choice. Filter and join admission both use it.
+
+    Args:
+        n: Documents.
+        tree: A PrefixTree over the documents, or None.
+        can_borrow: Callable(doc, parent, same_chunk) -> bool, asked
+            before a borrow; same_chunk says the parent is admitted in
+            the chunk being built. None allows every borrow.
+    """
+
+    WAIT = "wait"
+
+    def __init__(self, n, tree=None, can_borrow=None):
+        self.tree_parent = [None] * n if tree is None else list(tree.parent)
+        self.tree_shared = [0] * n if tree is None else list(tree.shared)
+        self.can_borrow = can_borrow
+        self.admitted = set()
+        self.skipped = set()       # documents that never run a chunk
+        self.chosen = {}           # admitted borrower -> (parent, shared)
+        self.borrowed_tokens = 0   # prefix tokens read from a parent
+
+    def add(self):
+        """A document streamed in after construction; it borrows nothing."""
+        self.tree_parent.append(None)
+        self.tree_shared.append(0)
+        return len(self.tree_parent) - 1
+
+    def detach(self, doc):
+        """The document's KV is already resident, so it borrows nothing."""
+        self.tree_parent[doc] = None
+        self.tree_shared[doc] = 0
+
+    def skip(self, doc):
+        """The document never runs a chunk, so its borrowers pack whole."""
+        self.skipped.add(doc)
+
+    def borrowers(self):
+        """Per document, how many documents the tree has borrow from it."""
+        counts = [0] * len(self.tree_parent)
+        for parent in self.tree_parent:
+            if parent is not None:
+                counts[parent] += 1
+        return counts
+
+    def decide(self, doc, chunk):
+        """WAIT, None to pack the whole document, or (parent, shared)."""
+        parent = self.tree_parent[doc]
+        if parent is None or parent in self.skipped:
+            return None
+        if parent not in self.admitted:
+            return self.WAIT
+        if self.can_borrow is not None and not self.can_borrow(
+                doc, parent, parent in chunk):
+            return None
+        return parent, self.tree_shared[doc]
+
+    def record(self, doc, choice):
+        """The document was admitted with decide()'s choice."""
+        self.admitted.add(doc)
+        if choice is not None:
+            self.chosen[doc] = choice
+            self.borrowed_tokens += choice[1]
+
+    def parent(self, doc):
+        """The parent an admitted document borrows from, or None."""
+        return self.chosen.get(doc, (None, 0))[0]
+
+    def shared(self, doc):
+        """The tokens an admitted document borrows; 0 when it packs whole."""
+        return self.chosen.get(doc, (None, 0))[1]
+
+
 class JoinAdmission:
     """Join scheduler: continuous anchor admission, stages mixed in one chunk.
 
@@ -141,6 +233,14 @@ class JoinAdmission:
         page_cost: Callable(tokens, base_tokens) giving the pages a
             key of that many rows takes, in the arena's every-token pages; None
             prices one pool of page_tokens pages.
+        tree: A PrefixTree over the anchors given at construction, or
+            None. Fresh anchors are admitted in tree order; one whose
+            parent is still queued waits, one whose parent's pages can
+            be borrowed packs and pays for only the tokens past its
+            shared length, and one whose parent has left packs whole.
+        can_borrow: Callable(anchor, parent, same_chunk) -> bool, asked
+            before a borrow; same_chunk says the parent is admitted in
+            the chunk being built. None allows every borrow.
 
     Each chunk fills in priority order: partner streams cut by the
     previous chunk, then anchors starting their next stage, then
@@ -157,8 +257,11 @@ class JoinAdmission:
     def __init__(self, prefix_tokens, stage_suffixes, chunk_budget,
                  arena_pages, page_tokens, frame_tokens=None,
                  resident=None, anchor_partners=None, temporary_suffix_pages=False,
-                 answer_dtype=None, canvas_tokens=0, page_cost=None):
+                 answer_dtype=None, canvas_tokens=0, page_cost=None,
+                 tree=None, can_borrow=None):
         self.answer_dtype = answer_dtype
+        n = len(prefix_tokens)
+        self.borrowing = Borrowing(n, tree, can_borrow)
         # page_cost(tokens, base_tokens) prices a key in the arena's
         # every-token pages; the default is one pool of page_tokens pages
         self.page_cost = page_cost or (
@@ -217,10 +320,13 @@ class JoinAdmission:
         # resident anchors first: they cost no prefix tokens and few
         # or no pages, so they never wait behind a page-blocked anchor
         n = len(self.prefix)
+        fresh_order = range(n) if tree is None else tree.order
         self.pending.extend(a for a in range(n)
                             if a in resident and self._stage[a] == -1)
-        self.pending.extend(a for a in range(n)
+        self.pending.extend(a for a in fresh_order
                             if a not in resident and self._stage[a] == -1)
+        for a in resident:
+            self.borrowing.detach(a)
 
 
     def _count(self, a, j):
@@ -282,6 +388,7 @@ class JoinAdmission:
             self._first.append(0)
             self._stage[a] = _DONE
             self._settled.append(("finished" if k == 1 else "dropped", a))
+            self.borrowing.skip(a)
             return a
         first = self.frame_rows[0] + self._suffix(a, 0, 0)
         if resident_pages is None and prefix + first > self.chunk_budget:
@@ -300,7 +407,11 @@ class JoinAdmission:
                 raise ValueError("anchor and one suffix exceed the KV arena")
             self._page_reserve = max(self._page_reserve, largest)
         self._first.append(first)
-        self._min_fresh = min(self._min_fresh, carried + first)
+        # the fewest tokens any fresh anchor can pack: a borrower
+        # packs only the tokens past its shared prefix
+        tree_shared = self.borrowing.tree_shared
+        shared = tree_shared[a] if a < len(tree_shared) else 0
+        self._min_fresh = min(self._min_fresh, max(0, carried - shared) + first)
         if not need:
             self._zero_cost += 1
         return a
@@ -318,6 +429,7 @@ class JoinAdmission:
         anchor_partners.
         """
         a = self._register(prefix_tokens, resident_pages, partners)
+        self.borrowing.add()
         if self._stage[a] == -1:
             self.pending.append(a)
         return a
@@ -358,8 +470,8 @@ class JoinAdmission:
         return self._suffix(a, j, i) + (self.frame_rows[j] if i == 0 else 0)
 
     def _suffix_page_cost(self, a, j, i):
-        remainder = (self.prefix[a] + self.frames[j]) % self.page_tokens
-        return self.page_cost(remainder + self._suffix(a, j, i), 0)
+        return partner_pages(self.page_cost, self.page_tokens, self.prefix[a],
+                             self.frames[j], self._suffix(a, j, i))
 
     def _take(self, a, j, i, room, page_room):
         """Return the partner run that fits the token and temporary page budgets."""
@@ -421,9 +533,15 @@ class JoinAdmission:
         # 2) fresh anchors: pages in queue order, chunk room may skip
         held = []
         blocked = False
+        admitted = set()
         while self.pending and room >= self._min_fresh:
             a = self.pending.popleft()
-            need = self._page_cost[a]
+            borrow = self.borrowing.decide(a, admitted)
+            if borrow == Borrowing.WAIT:
+                held.append(a)      # its parent is still queued
+                continue
+            need = (self._page_cost[a] if borrow is None
+                    else self.page_cost(self.prefix[a] - borrow[1] + self._extra))
             if blocked and need:
                 held.append(a)
                 if not self._zero_cost:
@@ -437,7 +555,8 @@ class JoinAdmission:
                 if not self._zero_cost:
                     break
                 continue
-            carried = self._carried[a]
+            carried = (self._carried[a] if borrow is None
+                       else self.prefix[a] - borrow[1])
             if carried + self._first[a] > room:
                 held.append(a)      # chunk room only; retry next chunk
                 continue
@@ -452,9 +571,11 @@ class JoinAdmission:
             groups.append((a, 0, 0, end, carried > 0))
             room -= carried + tokens
             free_pages -= need + pages
-            if not need:
+            if not self._page_cost[a]:
                 self._zero_cost -= 1
             self._stage[a] = 0
+            admitted.add(a)
+            self.borrowing.record(a, borrow)
             if self._launch(a, 0, end):
                 continued.append(a)
         self.pending.extendleft(reversed(held))
@@ -524,48 +645,56 @@ class JoinAdmission:
 
 
 class FilterAdmission:
-    """Filter chain scheduler: builds chunk groups, tracks arena residency.
+    """Filter chain scheduler: builds chunk groups in admission order.
+
+    Page accounting belongs to the arena: next_chunk takes its free
+    pages and admits documents whose own pages fit them.
 
     Args:
         doc_tokens: Per-document token counts.
         stage_tokens: Per-stage question suffix token counts.
         chunk_budget: Tokens per forward pass.
-        arena_pages: Page budget for admission. None disables page
-            accounting (single-stage).
+        arena_pages: Pages in the arena, or None when nothing is written
+            to it (single-stage).
         page_tokens: Tokens per arena page.
         kept_extra_tokens: Extra tokens per document that must fit in
             pages (shared preamble plus tail room).
         limit: Stop after this many survivors.
         page_cost: Callable(tokens, base_tokens) giving the pages a
-            document of that many rows takes, in the arena's every-token pages;
-            None prices one pool of page_tokens pages.
+            document of that many rows takes, in the arena's every-token
+            pages; None prices one pool of page_tokens pages.
+        tree: A PrefixTree over the documents, or None. Documents are
+            admitted in tree order, and borrow as Borrowing decides.
+        can_borrow: As Borrowing takes it.
 
     Survivor suffixes pack before fresh admissions. Pages are granted
-    in queue order; chunk room may be skipped.
+    in queue order; chunk room may be skipped. With a tree the
+    admission order is token-sorted, not table order, so a limit
+    takes the first survivors in that order.
     """
 
     def __init__(self, doc_tokens, stage_tokens, chunk_budget,
                  arena_pages, page_tokens, kept_extra_tokens=0,
-                 limit=None, available_pages=None, page_cost=None):
+                 limit=None, page_cost=None, tree=None, can_borrow=None):
         self.page_cost = page_cost or (
             lambda tokens, base_tokens=None: pages_for(tokens, page_tokens))
         self.doc_tokens = doc_tokens
+        n = len(doc_tokens)
+        self.borrowing = Borrowing(n, tree, can_borrow)
         self.stage_tokens = list(stage_tokens)
         self.chunk_budget = chunk_budget
         self.page_tokens = page_tokens
-        # None: no page bin - nothing is ever written to the arena,
-        # so there is nothing to account
-        self.free_pages = (arena_pages if available_pages is None
-                           else available_pages)
-        if (arena_pages is not None
-                and not 0 <= self.free_pages <= arena_pages):
-            raise ValueError("available_pages must fit inside arena_pages")
+        self.pages = arena_pages is not None
         self.blocked_pages = 0
         self.limit = limit
         self._survivor_count = 0
         # kept_extra_tokens: the shared question preamble that joins
         # the document's kept KV after stage 1, so pages must cover it
         self.kept_extra = kept_extra_tokens
+        if tree is not None and arena_pages is None:
+            raise ValueError("a prefix tree needs page accounting")
+        # a document packs whole when its parent has left, so the
+        # guard is on its full length
         for d, t in enumerate(self.doc_tokens):
             need = t + max(stage_tokens)
             if need > chunk_budget:
@@ -575,25 +704,36 @@ class FilterAdmission:
                     t + kept_extra_tokens) > arena_pages:
                 raise ValueError(f"document {d} needs more pages than "
                                  f"the arena holds")
-        self.pending = _CompactQueue(len(self.doc_tokens))
+        if tree is None or list(tree.order) == list(range(n)):
+            self.pending = _CompactQueue(n)
+        else:
+            self.pending = _CompactQueue(0)
+            self.pending.prepend(array("I", tree.order))
         self.ready = deque()       # (doc, stage) gated TRUE, next suffix
         self.in_flight = set()     # docs inside a launched chunk
-        self.resident = {}         # doc -> pages held
+        self.resident = set()      # admitted docs not yet released
         self.answers = {}          # doc -> [0/1 per answered stage]
+
+    def own_tokens(self, doc) -> int:
+        """The document's tokens past its borrowed shared prefix."""
+        return self.doc_tokens[doc] - self.borrowing.shared(doc)
 
     # ---- chunk building ------------------------------------------------
 
-    def next_chunk(self):
+    def next_chunk(self, free_pages=None):
         """Groups for the next chunk: [(doc, stage, fresh)].
 
-        fresh means the document's tokens are packed and its KV is
-        written to its pages. Returns [] when nothing is buildable.
+        free_pages is the arena's free pages, in every-token pages;
+        None when nothing is written to the arena. fresh means the
+        document's tokens are packed and its KV is written to its
+        pages. Returns [] when nothing is buildable.
         """
         if self._limit_reached():
             return []
         self.blocked_pages = 0
         room = self.chunk_budget
         groups = []
+        admitted = set()
         # 1) survivor suffixes, oldest first; one live stage per doc
         n_ready = len(self.ready)
         for _ in range(n_ready):
@@ -606,29 +746,35 @@ class FilterAdmission:
             self.in_flight.add(doc)
             room -= cost
         # 2) fresh admissions: pages in queue order, chunk room may skip
-        blocked_pages = False
         skipped = array("I")
-        while self.pending and not blocked_pages:
+        while self.pending:
             doc = self.pending.popleft()
-            if self.free_pages is not None:
-                need_pages = self.page_cost(
-                    self.doc_tokens[doc] + self.kept_extra)
-                if need_pages > self.free_pages:
+            choice = self.borrowing.decide(doc, admitted)
+            if choice == Borrowing.WAIT:
+                # the parent is queued behind a full chunk
+                skipped.append(doc)
+                continue
+            own = self.doc_tokens[doc] - (choice[1] if choice else 0)
+            need_pages = 0
+            if free_pages is not None:
+                need_pages = self.page_cost(own + self.kept_extra)
+                if need_pages > free_pages:
                     # pages are granted in order: put it back and stop
                     # claiming pages behind it
                     self.pending.appendleft(doc)
-                    self.blocked_pages = need_pages - self.free_pages
-                    blocked_pages = True
+                    self.blocked_pages = need_pages - free_pages
                     break
-            cost = self.stage_tokens[0] + self.doc_tokens[doc]
+            cost = self.stage_tokens[0] + own
             if cost > room:
                 skipped.append(doc)   # chunk room only; retry next chunk
                 continue
-            if self.free_pages is not None:
-                self.free_pages -= need_pages
-                self.resident[doc] = need_pages
+            if free_pages is not None:
+                free_pages -= need_pages
+            self.borrowing.record(doc, choice)
+            self.resident.add(doc)
             groups.append((doc, 0, True))
             self.in_flight.add(doc)
+            admitted.add(doc)
             room -= cost
         self.pending.prepend(skipped)
         return groups
@@ -638,14 +784,12 @@ class FilterAdmission:
     def report(self, doc, stage, passed, release=True):
         """Record one answer.
 
-        Frees pages on FALSE or last stage; otherwise queues the
-        next-stage suffix.
+        Queues the next-stage suffix after TRUE at a stage before the
+        last. Otherwise the document is done: with release it returns
+        (doc,) for the caller to free, and without it the caller keeps
+        the document's KV.
 
-        release=False assumes the caller rewinds the kept document
-        to its own tokens: the tail pages return here, the rest come
-        back through add_free_pages if the pool evicts it.
-
-        Returns docs whose pages were freed.
+        Returns docs to free.
         """
         self.in_flight.discard(doc)
         self.answers.setdefault(doc, []).append(1 if passed else 0)
@@ -655,30 +799,10 @@ class FilterAdmission:
         if passed and not last:
             self.ready.append((doc, stage + 1))
             return ()
-        if self.free_pages is None:
+        self.resident.discard(doc)
+        if not self.pages or not release:
             return ()
-        held = self.resident.pop(doc)
-        if release:
-            self.free_pages += held
-            return (doc,)
-        self.free_pages += held - self.page_cost(
-            self.doc_tokens[doc], self.doc_tokens[doc])
-        return ()
-
-    def trim(self, doc, pages):
-        """Credit pages a resident document released after its pass."""
-        if pages < 0:
-            raise ValueError("a trim cannot take pages")
-        if self.free_pages is None or not pages:
-            return
-        self.resident[doc] -= pages
-        self.free_pages += pages
-
-    def add_free_pages(self, pages):
-        """Add pages released by retained KV outside this chain."""
-        if pages < 0 or self.free_pages is None:
-            raise ValueError("invalid external page release")
-        self.free_pages += pages
+        return (doc,)
 
     # ---- progress ------------------------------------------------------
 
@@ -693,15 +817,15 @@ class FilterAdmission:
                 and not self.in_flight)
 
     def drain_ready(self):
-        """Free pages of docs still queued when the limit ends the run early.
+        """Docs still queued for a stage when the limit ends the run early.
 
-        Returns drained docs for arena key cleanup.
+        Returns them for the caller to free.
         """
         out = []
         while self.ready:
             doc, _ = self.ready.popleft()
-            if self.free_pages is not None:
-                self.free_pages += self.resident.pop(doc)
+            self.resident.discard(doc)
+            if self.pages:
                 out.append(doc)
         return out
 

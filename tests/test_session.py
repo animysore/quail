@@ -237,7 +237,7 @@ def test_explain_analyze_shows_measured_rows_beside_estimates(
                                                 int(second[1]) - 1]
 
 
-def test_query_rows_observers_and_saved_reports(sess):
+def test_query_rows_observers_saved_reports_and_streamed_results(sess):
     res = _run(sess.sql(FILTER_SQL), make_executor(TRUTH))
     assert res.columns == ["r.id"]
     assert sorted(res.to_rows()) == [("r0",), ("r3",)]
@@ -283,6 +283,39 @@ def test_query_rows_observers_and_saved_reports(sess):
     assert restored.node_metrics == result.node_metrics
     assert restored.explain() == result.explain()
 
+    # results are assembled from survivor indices and join tables
+    true_join_tables = [
+        document_index_table({"r1": [0, 1], "a1": [0, 0]}, "join_answers"),
+        document_index_table({"r2": [0, 1], "a1": [0, 0]}, "join_answers"),
+        document_index_table({"r2": [0, 1, 1], "a2": [0, 0, 1]}, "join_answers"),
+    ]
+    survivors = {alias: pa.array(rows, type=pa.int32()) for alias, rows in
+                 {"r1": [0, 1], "r2": [0, 1], "a1": [0], "a2": [0, 1]}.items()}
+    declaration, _ = build_result_declaration(true_join_tables, survivors, "r1")
+    assert count_rows(declaration) == 6
+
+    relation = document_index_table({"r": list(range(5))}, "filter_survivors")
+    assert relation.schema.metadata[b"quail.kind"] == b"filter_survivors"
+    survivors = {"r": pa.array(range(5), type=pa.int32())}
+    declaration, index_schema = build_result_declaration([], survivors, "r")
+    schema = pa.schema([pa.field("r.id", pa.string(), nullable=False)],
+                       metadata={b"quail.kind": b"query_result"})
+    result = QueryResult(
+        columns=["r.id"], declaration=declaration,
+        document_index_schema=index_schema, output_schema=schema,
+        projection=[("r", pa.array([f"r{i}" for i in range(5)]))],
+        report={}, survivor_indices=survivors, true_join_tables={})
+
+    reader = result.execute_stream(batch_rows=2)
+    batches = list(reader)
+    assert isinstance(reader, pa.RecordBatchReader)
+    assert [len(batch) for batch in batches] == [2, 2, 1]
+    assert pa.Table.from_batches(batches).column("r.id").to_pylist() == [
+        "r0", "r1", "r2", "r3", "r4"]
+    assert result.count() == 5
+    assert result.collect(limit=3).column("r.id").to_pylist() == ["r0", "r1", "r2"]
+    assert not hasattr(result, "rows")
+
 
 class NodeTypes:
     """Observer that records the node types it saw."""
@@ -299,7 +332,18 @@ class NodeTypes:
         return {"types": list(self.types)}
 
 
-def test_pair_table_lists_equal_keys_once_each():
+def _pair_query(session, on):
+    claims = session.docs("claims").alias("c")
+    partner = session.docs("evidence").alias("e")
+    query = (claims.join(partner, on=quail.col("c.url") == quail.col("e.url"))
+             if on else claims.join(partner))
+    return query.ai_filter(
+        quail.prompt("Does {1} support {0}?", quail.col("c.claim"),
+                     quail.col("e.text")),
+        selectivity=0.5).select("c.id", "e.id")
+
+
+def test_pair_table_lists_equal_keys_once_and_the_session_ships_it():
     pairs = pair_table(
         "c", [pa.array(["u1", "u2", None, "u1"])],
         "e", [pa.array(["u2", "u1", "u1"])])
@@ -313,19 +357,6 @@ def test_pair_table_lists_equal_keys_once_each():
         "e", [pa.array(["u1", "u1"]), pa.array([2, 2], type=pa.int8())])
     assert pairs.to_pydict() == {"c": [1, 1], "e": [0, 1]}
 
-
-def _pair_query(session, on):
-    claims = session.docs("claims").alias("c")
-    partner = session.docs("evidence").alias("e")
-    query = (claims.join(partner, on=quail.col("c.url") == quail.col("e.url"))
-             if on else claims.join(partner))
-    return query.ai_filter(
-        quail.prompt("Does {1} support {0}?", quail.col("c.claim"),
-                     quail.col("e.text")),
-        selectivity=0.5).select("c.id", "e.id")
-
-
-def test_session_plans_prices_and_ships_the_pair_table():
     with quail.Session(CONFIG, tokenizer=lambda text: list(text.encode())) as session:
         register_claims_evidence(session)
         paired = _pair_query(session, on=True)
@@ -375,51 +406,14 @@ assert "modal" not in sys.modules
 """
 
 
-def test_engine_import_and_gpu_requirement(sess, monkeypatch):
+def test_engine_import_gpu_requirement_and_quickstart_demos(
+        sess, monkeypatch, tmp_path):
     subprocess.run([sys.executable, "-c", IMPORT_TEXT], check=True)
     monkeypatch.setattr(execution, "gpu_problem", lambda: "no CUDA GPU is visible")
     with pytest.raises(RuntimeError, match="process with a CUDA GPU") as error:
         sess.sql(FILTER_SQL).run()
     assert "no CUDA GPU is visible" in str(error.value)
 
-
-def test_arrow_result_assembly_streaming_and_collection():
-    true_join_tables = [
-        document_index_table({"r1": [0, 1], "a1": [0, 0]}, "join_answers"),
-        document_index_table({"r2": [0, 1], "a1": [0, 0]}, "join_answers"),
-        document_index_table({"r2": [0, 1, 1], "a2": [0, 0, 1]}, "join_answers"),
-    ]
-    survivors = {alias: pa.array(rows, type=pa.int32()) for alias, rows in
-                 {"r1": [0, 1], "r2": [0, 1], "a1": [0], "a2": [0, 1]}.items()}
-    declaration, _ = build_result_declaration(true_join_tables, survivors, "r1")
-    assert count_rows(declaration) == 6
-
-    relation = document_index_table({"r": list(range(5))}, "filter_survivors")
-    assert relation.schema.metadata[b"quail.kind"] == b"filter_survivors"
-    survivors = {"r": pa.array(range(5), type=pa.int32())}
-    declaration, index_schema = build_result_declaration([], survivors, "r")
-    schema = pa.schema([pa.field("r.id", pa.string(), nullable=False)],
-                       metadata={b"quail.kind": b"query_result"})
-    result = QueryResult(
-        columns=["r.id"], declaration=declaration,
-        document_index_schema=index_schema, output_schema=schema,
-        projection=[("r", pa.array([f"r{i}" for i in range(5)]))],
-        report={}, survivor_indices=survivors, true_join_tables={})
-
-    reader = result.execute_stream(batch_rows=2)
-    batches = list(reader)
-    assert isinstance(reader, pa.RecordBatchReader)
-    assert [len(batch) for batch in batches] == [2, 2, 1]
-    assert pa.Table.from_batches(batches).column("r.id").to_pylist() == [
-        "r0", "r1", "r2", "r3", "r4"]
-    assert result.count() == 5
-    assert result.collect(limit=3).column("r.id").to_pylist() == ["r0", "r1", "r2"]
-    assert not hasattr(result, "rows")
-
-
-@pytest.mark.parametrize("on_modal", [False, True])
-def test_quickstarts_return_collected_rows_after_session_closes(
-        monkeypatch, tmp_path, on_modal):
     reviews = pa.table({"id": ["rv0", "rv1"], "body": [
         "The acting was excellent.", "The acting was poor."]})
     monkeypatch.setattr(quickstart, "load_reviews", lambda: reviews)
@@ -442,21 +436,25 @@ def test_quickstarts_return_collected_rows_after_session_closes(
 
     monkeypatch.setattr(quail.Session, "close", record_close)
 
-    run = quickstart_modal.run_query.get_raw_f() if on_modal else quickstart.run_query
-    rows, report = run()
-    assert len(closed) == 1
-    assert closed[0]._token_directory is None
-    assert rows.to_pylist() == [{"r.id": "rv0"}]
-    assert report["fresh_tokens"] == 1234
-    assert report["worker_total_s"] >= 0
-    if not on_modal:
-        assert "result_volume_path" not in report
-        assert commits == []
-        return
-    path = Path(report["result_volume_path"])
-    assert path.parent == tmp_path / "chosen-path"
-    assert json.loads(path.read_text()) == report
-    assert commits == ["volume"]
+    for on_modal in (False, True):
+        closed.clear()
+        commits.clear()
+        run = (quickstart_modal.run_query.get_raw_f() if on_modal
+               else quickstart.run_query)
+        rows, report = run()
+        assert len(closed) == 1, on_modal
+        assert closed[0]._token_directory is None, on_modal
+        assert rows.to_pylist() == [{"r.id": "rv0"}], on_modal
+        assert report["fresh_tokens"] == 1234, on_modal
+        assert report["worker_total_s"] >= 0, on_modal
+        if not on_modal:
+            assert "result_volume_path" not in report
+            assert commits == []
+            continue
+        path = Path(report["result_volume_path"])
+        assert path.parent == tmp_path / "chosen-path"
+        assert json.loads(path.read_text()) == report
+        assert commits == ["volume"]
 
     def fail():
         raise RuntimeError("query failed")

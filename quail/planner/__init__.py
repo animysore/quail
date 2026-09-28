@@ -18,6 +18,7 @@ from .decide import (
     plan_quail,
     plan_query,
     preamble_tokens,
+    refine_plan,
 )
 from .plan import CorpusStats, EngineConfig, PhysicalPlan, Refusal
 
@@ -35,4 +36,5 @@ __all__ = [
     "plan_quail",
     "plan_query",
     "preamble_tokens",
+    "refine_plan",
 ]

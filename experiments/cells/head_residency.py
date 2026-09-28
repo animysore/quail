@@ -72,10 +72,6 @@ def probe(model_name: str) -> str:
     from transformers import AutoTokenizer
 
     from quail.backends.quail.executor.arena import KVArena
-    from quail.backends.quail.executor.attention import (
-        FILTER_ATTENTION,
-        JOIN_ATTENTION,
-    )
     from quail.backends.quail.executor.loop import run_filter
     from quail.backends.quail.executor.model import load_model
     from quail.backends.quail.executor.models import build_pipeline
@@ -113,12 +109,12 @@ def probe(model_name: str) -> str:
     flags, doc_ids, q_ids = _planted(tokenizer)
     correct = {}
     with torch.inference_mode():
-        # the three forward-pass paths: unified paged, merge_quant
-        # paged, and the unpaged causal fast path
+        # the three forward-pass paths: unified paged, tree paged,
+        # and the unpaged causal fast path
         for label, mode, writes in (
-                ("unified", FILTER_ATTENTION, True),
-                ("merge_quant", JOIN_ATTENTION, True),
-                ("unpaged", FILTER_ATTENTION, False)):
+                ("unified", "unified", True),
+                ("tree", "tree", True),
+                ("unpaged", "unified", False)):
             answers, _, _ = run_filter(
                 torch, arena, pipeline, async_ans, doc_ids, [q_ids],
                 chunk, arena_writes=writes, attention_mode=mode)

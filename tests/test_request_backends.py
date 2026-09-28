@@ -178,7 +178,30 @@ def _join_node(backend_name="stock_vllm"):
     )
 
 
-def test_suffix_major_falls_back_when_the_anchors_exceed_kv():
+def test_filter_and_join_answers_and_suffix_major_fallback():
+    for model in (QWEN3_4B_FP8, DIFFUSION_GEMMA_26B_FP8):
+        settings = {}
+        if model is DIFFUSION_GEMMA_26B_FP8:
+            settings = {"client": _ScoredClient(), "false_ids": [0],
+                        "sampling_params": SimpleNamespace(logprobs=500)}
+        execution = _execution(
+            {"d": [[np.int32(10)], [11]], "r": [[10], [11]], "p": [[20], [21]]},
+            model=model, **settings)
+
+        filtered = execution.execute(FILTER_NODE, {})
+        assert filtered.outputs["filter_answers:d"].to_pydict() == {
+            "d": [0, 1], "predicate": [0, 0], "answer": [True, False]}, model.name
+        assert filtered.outputs["ids:d"] == [0], model.name
+        assert filtered.metrics.evaluated_documents == 2, model.name
+
+        joined = execution.execute(_join_node(), {})
+        assert joined.outputs["join_answers:0"].to_pydict() == {
+            "r": [0, 0, 1, 1], "p": [0, 1, 0, 1],
+            "answer": [True, True, False, False]}, model.name
+        assert joined.outputs["ids:r"] == [0], model.name
+        assert joined.outputs["ids:p"] == [0, 1], model.name
+        assert joined.metrics.evaluated_document_pairs == 4, model.name
+
     class RecordingClient(_Client):
         def generate(self, prompts, sampling_params, use_tqdm=False):
             self.prompts = [tuple(prompt["prompt_token_ids"]) for prompt in prompts]
@@ -196,30 +219,6 @@ def test_suffix_major_falls_back_when_the_anchors_exceed_kv():
                              for prompt in execution.client.prompts]
     assert orders[6] == [(10, 20), (11, 20), (10, 21), (11, 21)]
     assert orders[5] == [(10, 20), (10, 21), (11, 20), (11, 21)]
-
-
-@pytest.mark.parametrize("model", [QWEN3_4B_FP8, DIFFUSION_GEMMA_26B_FP8])
-def test_filter_and_join_answer_relations(model):
-    settings = {}
-    if model is DIFFUSION_GEMMA_26B_FP8:
-        settings = {"client": _ScoredClient(), "false_ids": [0],
-                    "sampling_params": SimpleNamespace(logprobs=500)}
-    execution = _execution(
-        {"d": [[np.int32(10)], [11]], "r": [[10], [11]], "p": [[20], [21]]},
-        model=model, **settings)
-
-    filtered = execution.execute(FILTER_NODE, {})
-    assert filtered.outputs["filter_answers:d"].to_pydict() == {
-        "d": [0, 1], "predicate": [0, 0], "answer": [True, False]}
-    assert filtered.outputs["ids:d"] == [0]
-    assert filtered.metrics.evaluated_documents == 2
-
-    joined = execution.execute(_join_node(), {})
-    assert joined.outputs["join_answers:0"].to_pydict() == {
-        "r": [0, 0, 1, 1], "p": [0, 1, 0, 1], "answer": [True, True, False, False]}
-    assert joined.outputs["ids:r"] == [0]
-    assert joined.outputs["ids:p"] == [0, 1]
-    assert joined.metrics.evaluated_document_pairs == 4
 
 
 def test_sglang_submission_and_cancellation():
@@ -269,7 +268,10 @@ def test_sglang_submission_and_cancellation():
     asyncio.run(run())
 
 
-def test_vllm_engine_settings_follow_the_model():
+def test_vllm_engine_settings_tokenizer_and_canvas_follow_the_model(monkeypatch):
+    from quail.backends.quail.executor.models.diffusion_gemma import canvas_token_ids
+    from quail.backends.vllm import GigatokenVLLMTokenizer, diffusion_canvas
+
     engine = VLLMEngine()
     qwen = engine.llm_kwargs(QWEN3_4B_FP8)
     assert qwen["max_num_batched_tokens"] == 25_305
@@ -296,10 +298,6 @@ def test_vllm_engine_settings_follow_the_model():
         "max_tokens": 1, "logprobs": -1, "detokenize": False}
     assert sampling_kwargs([1, 2], canvas_tokens=256) == {"max_tokens": 16}
 
-
-def test_vllm_gigatoken_adapter_loads_gigatoken_directly(monkeypatch):
-    from quail.backends.vllm import GigatokenVLLMTokenizer
-
     adapter = SimpleNamespace(get_vocab=lambda: {"a": 0, "abc": 1})
     sources = []
 
@@ -321,11 +319,6 @@ def test_vllm_gigatoken_adapter_loads_gigatoken_directly(monkeypatch):
     assert loaded.truncation_side == "right"
     assert loaded.max_token_id == 1
     assert loaded.max_chars_per_token == 3
-
-
-def test_vllm_canvas_matches_quail_after_boot_and_slot_reuse(monkeypatch):
-    from quail.backends.quail.executor.models.diffusion_gemma import canvas_token_ids
-    from quail.backends.vllm import diffusion_canvas
 
     spec = DIFFUSION_GEMMA_26B_FP8
 

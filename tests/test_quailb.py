@@ -2,7 +2,6 @@
 
 import pyarrow as pa
 import pyarrow.parquet as pq
-import pytest
 
 import quail
 from quail.bench.quailb import (
@@ -53,7 +52,41 @@ def _standin_sets(tmp_path):
         pq.write_table(pa.table({"id": ids, **columns}), tmp_path / f"{name}.parquet")
 
 
-def test_submission_to_answer_timing_includes_common_answer_work():
+def test_all_queries_compile_and_plan_and_answer_timing_adds_common_work(tmp_path):
+    _standin_sets(tmp_path)
+    expected = {
+        *(f"IMDB-{i}" for i in range(1, 11)),
+        *(f"BIO-{i}" for i in range(1, 5)),
+        *(f"FEV-{i}" for i in range(1, 11)),
+        *(f"LEP-{i}" for i in range(1, 6)),
+        "AGENT-1", "AGENT-2",
+        "PRIV-1", "PRIV-2",
+    }
+    assert set(QUERY_ORDER) == expected - {"PRIV-1", "PRIV-2"}
+    for backend in ("quail", "stock_vllm", "pipelined_vllm", "pipelined_sglang"):
+        with quail.Session(
+            EngineConfig(gpus=1, model="qwen3-4b-fp8", backend=backend,
+                         device="h100-sxm"),
+            tokenizer=lambda text: list(text.encode()),
+        ) as sess:
+            register_tables(sess, tmp_path)
+            qdefs = queries(sess)
+            assert set(qdefs) == expected, backend
+            for qid, (_, build) in qdefs.items():
+                case = f"{backend} {qid}"
+                query = build()
+                operators = query.logical.operators()
+                selectivities = [
+                    predicate.selectivity for chain in operators.filters.values()
+                    for predicate in chain]
+                selectivities += [join.selectivity for join in operators.joins]
+                assert all((s is None) == qid.startswith("PRIV-")
+                           for s in selectivities), case
+                plan = query.plan()
+                assert not isinstance(plan, Refusal), f"{case} refused: {plan}"
+                assert plan.settings["order_rule"] == "by_cost", case
+                assert "physical:" in query.explain(), case
+
     report = {
         "model_wall_s": 10.0,
         "finish_s": 0.5,
@@ -66,37 +99,3 @@ def test_submission_to_answer_timing_includes_common_answer_work():
     assert _submission_to_answer_s(
         "pipelined_vllm", report, frontend_s=1.0, answer_prepare_s=0.75
     ) == 11.25
-
-
-@pytest.mark.parametrize(
-    "backend", ["quail", "stock_vllm", "pipelined_vllm", "pipelined_sglang"])
-def test_all_queries_compile_and_plan(tmp_path, backend):
-    _standin_sets(tmp_path)
-    sess = quail.Session(
-        EngineConfig(gpus=1, model="qwen3-4b-fp8", backend=backend,
-                     device="h100-sxm"),
-        tokenizer=lambda text: list(text.encode()),
-    )
-    register_tables(sess, tmp_path)
-    qdefs = queries(sess)
-    expected = {
-        *(f"IMDB-{i}" for i in range(1, 11)),
-        *(f"BIO-{i}" for i in range(1, 5)),
-        *(f"FEV-{i}" for i in range(1, 11)),
-        *(f"LEP-{i}" for i in range(1, 6)),
-        "AGENT-1", "AGENT-2",
-        "PRIV-1", "PRIV-2",
-    }
-    assert set(qdefs) == expected
-    assert set(QUERY_ORDER) == expected - {"PRIV-1", "PRIV-2"}
-    for qid, (_, build) in qdefs.items():
-        query = build()
-        operators = query.logical.operators()
-        selectivities = [predicate.selectivity for chain in operators.filters.values()
-                         for predicate in chain]
-        selectivities += [join.selectivity for join in operators.joins]
-        assert all((s is None) == qid.startswith("PRIV-") for s in selectivities), qid
-        plan = query.plan()
-        assert not isinstance(plan, Refusal), f"{qid} refused: {plan}"
-        assert plan.settings["order_rule"] == "by_cost", qid
-        assert "physical:" in query.explain(), qid

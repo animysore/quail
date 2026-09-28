@@ -63,8 +63,8 @@ def test_concurrent_processes_compile_once_and_touch_in_parallel(tmp_path):
         results.close()
 
 
-@pytest.mark.parametrize("failure", ["compile", "synchronize"])
-def test_warmup_failure_writes_no_marker(monkeypatch, tmp_path, failure):
+def test_warmup_failure_writes_no_marker_and_touch_warms_the_join_chunk(
+        monkeypatch, tmp_path):
     path = tmp_path / "warm.json"
     monkeypatch.setattr(loop, "_marker_path", lambda *args: str(path))
     monkeypatch.setattr(loop, "_marker_identity", lambda *args: {"version": 1})
@@ -72,22 +72,22 @@ def test_warmup_failure_writes_no_marker(monkeypatch, tmp_path, failure):
     def fail(*args):
         raise RuntimeError("GPU failed")
 
-    torch = _stub_torch()
-    monkeypatch.setattr(loop, "compile_kernels",
-                        fail if failure == "compile" else lambda *args: None)
-    if failure == "synchronize":
-        torch.cuda.synchronize = fail
-    with pytest.raises(RuntimeError, match="GPU failed"):
-        loop.warm_kernels(torch, None, None, None, 100, model_name="model")
-    assert not path.exists()
+    for failure in ("compile", "synchronize"):
+        torch = _stub_torch()
+        monkeypatch.setattr(loop, "compile_kernels",
+                            fail if failure == "compile" else lambda *args: None)
+        if failure == "synchronize":
+            torch.cuda.synchronize = fail
+        with pytest.raises(RuntimeError, match="GPU failed"):
+            loop.warm_kernels(torch, None, None, None, 100, model_name="model")
+        assert not path.exists(), failure
 
-    torch.cuda.synchronize = lambda: None
-    monkeypatch.setattr(loop, "compile_kernels", lambda *args: None)
-    assert loop.warm_kernels(torch, None, None, None, 100,
-                             model_name="model")["tier"] == "compile"
+        torch.cuda.synchronize = lambda: None
+        monkeypatch.setattr(loop, "compile_kernels", lambda *args: None)
+        assert loop.warm_kernels(torch, None, None, None, 100,
+                                 model_name="model")["tier"] == "compile", failure
+        path.unlink()
 
-
-def test_touch_kernels_warms_the_join_chunk(monkeypatch):
     calls = []
     monkeypatch.setattr(loop, "_forward_warm",
                         lambda *args, **kwargs: calls.append(kwargs))

@@ -4,7 +4,7 @@ import os
 import threading
 import time
 from concurrent.futures import Future, ThreadPoolExecutor
-from dataclasses import replace
+from dataclasses import fields, replace
 from itertools import chain
 from numbers import Integral
 from pathlib import Path
@@ -44,10 +44,19 @@ from quail.logical import (
     oriented_join_conditions,
 )
 from quail.physical import PortRef, Project, Scan, ValueType, encode_graph
-from quail.planner import explain, plan_query
+from quail.planner import explain, plan_query, refine_plan
 from quail.planner.logical_optimizer import LogicalPlanningContext, apply_logical_rules
 from quail.planner.plan import EngineConfig, Refusal, resolve_model
 from quail.progress import Progress, say
+
+
+def _node_metrics(metrics: dict) -> NodeMetrics:
+    """Rebuild a node's metrics from a report; extra numbers go to extension."""
+    names = {field.name for field in fields(NodeMetrics)} - {"extension"}
+    return NodeMetrics(
+        **{name: value for name, value in metrics.items() if name in names},
+        extension={name: value for name, value in metrics.items()
+                   if name not in names})
 
 
 class RefusalError(RuntimeError):
@@ -740,13 +749,27 @@ class Query:
         return text
 
     def wait_for_tokens(self) -> None:
-        """Block until every background tokenization has finished."""
+        """Block until every background tokenization has finished.
+
+        A plan made on estimated lengths then gets the physical rules
+        that read the token stores applied with the exact inputs.
+        """
         started = time.perf_counter()
+        refine = bool(self._token_futures)
         for alias, future in list(self._token_futures.items()):
             self._token_inputs[alias] = future.result()
+            self._doc_tokens[alias] = self._token_inputs[alias].lengths
             self._token_finished_at.setdefault(alias, time.perf_counter())
             del self._token_futures[alias]
         self.token_wait_s += time.perf_counter() - started
+        if refine and self._plan is not None:
+            self._plan = refine_plan(
+                self._plan, model=self.session.model,
+                device=self.session.device, doc_tokens=self._doc_tokens,
+                gpus=self.session.config.gpus, order=self.order,
+                backend=self.session.config.backend,
+                registry=self.session.registry,
+                tokenizer=self.session.tokenizer)
 
     def run(self, plan=None) -> QueryResult:
         """Execute the query in the current process.
@@ -957,7 +980,7 @@ class Query:
             ),
             initial_outputs=response.outputs,
             initial_metrics={
-                node_id: NodeMetrics(**metrics)
+                node_id: _node_metrics(metrics)
                 for node_id, metrics in out.get("node_metrics", {}).items()
             },
         )

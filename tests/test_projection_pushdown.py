@@ -45,7 +45,7 @@ def _session(tmp_path, tokenizer=fake_tok):
     return session
 
 
-def test_projected_results_and_token_reuse(tmp_path):
+def test_projected_results_token_reuse_and_join_projection(tmp_path):
     reviews = ["good one", "bad one", "fine one"]
     calls = []
 
@@ -96,8 +96,6 @@ def test_projected_results_and_token_reuse(tmp_path):
     assert len(calls) == tokenized
     session.close()
 
-
-def test_filtered_sql_join_projects_both_sides_without_recombine(tmp_path):
     session = _session(tmp_path)
     session.register("products", quail.DocumentProvider.from_table(pa.table({
         "asin": ["p0", "p1"], "description": ["product 0", "product 1"],

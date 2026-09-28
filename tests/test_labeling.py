@@ -28,7 +28,7 @@ def _write_json(path, value):
     path.write_text(json.dumps(value))
 
 
-def test_corpus_identity_and_label_reuse(monkeypatch, tmp_path):
+def test_corpus_identity_label_reuse_and_saved_parts(monkeypatch, tmp_path):
     rows = {"reviews": [{"id": "r0", "body": "a"}, {"id": "r1", "body": "b"}]}
     assert (corpus_identity(rows, 0.1, DATA_SEED, SOURCE_REVISIONS)
             == _corpus_identity(rows, 0.1))
@@ -73,10 +73,8 @@ def test_corpus_identity_and_label_reuse(monkeypatch, tmp_path):
     with pytest.raises(ValueError, match="table reviews changed"):
         _check_reused_label_set(spec, "ls_old", source_collection, target)
 
-
-def test_saved_label_parts_and_resume(monkeypatch, tmp_path):
+    # saved label parts resume a run and compact once
     spec = _spec("quailb.imdb.review.discusses_ending")
-    monkeypatch.setattr(labeling, "ROOT", tmp_path)
     parts = tmp_path / "label_sets" / spec.workload / spec.slug / "ls_test" / "parts"
     parts.mkdir(parents=True)
     saved = [{"answer": i % 2 == 0, "label_source": MODEL_NAME,
@@ -334,37 +332,8 @@ class _FakeS3:
         self.uploads.append(key)
 
 
-def test_publish_uploads_only_what_a_reader_needs(monkeypatch, tmp_path):
-    monkeypatch.setattr(labeling, "ROOT", tmp_path)
-    spec = _spec("quailb.imdb.review.discusses_ending")
-    monkeypatch.setattr(labeling, "PREDICATES", (spec,))
-    monkeypatch.setattr(labeling, "PREDICATE_BY_KEY", {})
-    corpus_dir = tmp_path / "corpora" / "c_x"
-    label_dir = tmp_path / "label_sets" / spec.workload / spec.slug / "ls_x"
-    (label_dir / "parts").mkdir(parents=True)
-    corpus_dir.mkdir(parents=True)
-    for path in (corpus_dir / "manifest.json",
-                 corpus_dir / "active_collection.json", label_dir / "manifest.json",
-                 tmp_path / "collections/gt_x/summary.json"):
-        _write_json(path, {})
-    (corpus_dir / "reviews.parquet").write_bytes(b"rows")
-    (label_dir / "labels.parquet").write_bytes(b"labels")
-    (label_dir / "parts" / "part_000000_000002.parquet").write_bytes(b"p")
-    _write_json(tmp_path / "collections/gt_x/manifest.json", {
-        "status": "complete", "corpus_id": "c_x", "label_sets": {spec.key: "ls_x"}})
-    prefix = f"{GROUND_TRUTH_ROOT}/label_sets/{spec.workload}/{spec.slug}"
-    client = _FakeS3({f"{prefix}/ls_x/labels.parquet": 6})
-
-    result = labeling.publish(tmp_path, ["gt_x"], client=client)
-
-    assert result["uploaded"] == 6 and result["skipped"] == 1
-    assert not any("/parts/" in key for key in client.uploads)
-    assert f"{GROUND_TRUTH_ROOT}/corpora/c_x/reviews.parquet" in client.uploads
-    assert (f"{GROUND_TRUTH_ROOT}/corpora/c_x/active_collection.json"
-            in client.uploads)
-
-
-def test_activate_new_predicate_reuses_existing_workload_labels(monkeypatch, tmp_path):
+def test_activate_reuses_workload_labels_and_publish_uploads_reader_files(
+        monkeypatch, tmp_path):
     old = _spec("quailb.biodex.report.describes_serious_adverse_event")
     new = _spec("quailb.biodex.reaction.is_neurological")
     monkeypatch.setattr(labeling, "ROOT", tmp_path)
@@ -409,3 +378,31 @@ def test_activate_new_predicate_reuses_existing_workload_labels(monkeypatch, tmp
     with pytest.raises(ValueError, match="unknown relabeled predicates"):
         labeling.activate_reused_collection(
             0.1, "c_target", "gt_source", "", relabeled_predicates=("unknown",))
+
+    # publish uploads only what a reader needs
+    spec = _spec("quailb.imdb.review.discusses_ending")
+    monkeypatch.setattr(labeling, "PREDICATES", (spec,))
+    monkeypatch.setattr(labeling, "PREDICATE_BY_KEY", {})
+    corpus_dir = tmp_path / "corpora" / "c_x"
+    label_dir = tmp_path / "label_sets" / spec.workload / spec.slug / "ls_x"
+    (label_dir / "parts").mkdir(parents=True)
+    corpus_dir.mkdir(parents=True)
+    for path in (corpus_dir / "manifest.json",
+                 corpus_dir / "active_collection.json", label_dir / "manifest.json",
+                 tmp_path / "collections/gt_x/summary.json"):
+        _write_json(path, {})
+    (corpus_dir / "reviews.parquet").write_bytes(b"rows")
+    (label_dir / "labels.parquet").write_bytes(b"labels")
+    (label_dir / "parts" / "part_000000_000002.parquet").write_bytes(b"p")
+    _write_json(tmp_path / "collections/gt_x/manifest.json", {
+        "status": "complete", "corpus_id": "c_x", "label_sets": {spec.key: "ls_x"}})
+    prefix = f"{GROUND_TRUTH_ROOT}/label_sets/{spec.workload}/{spec.slug}"
+    client = _FakeS3({f"{prefix}/ls_x/labels.parquet": 6})
+
+    result = labeling.publish(tmp_path, ["gt_x"], client=client)
+
+    assert result["uploaded"] == 6 and result["skipped"] == 1
+    assert not any("/parts/" in key for key in client.uploads)
+    assert f"{GROUND_TRUTH_ROOT}/corpora/c_x/reviews.parquet" in client.uploads
+    assert (f"{GROUND_TRUTH_ROOT}/corpora/c_x/active_collection.json"
+            in client.uploads)

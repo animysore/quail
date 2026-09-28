@@ -5,7 +5,6 @@ from fakes import cpu_staging
 
 from quail.backends.quail.executor import loop
 from quail.backends.quail.executor.arena import KVArena
-from quail.backends.quail.executor.pack import FilterAdmission
 
 torch = pytest.importorskip("torch")
 
@@ -18,6 +17,11 @@ def cpu_arena(pages=64, sliding_pages=16):
                    dtype=torch.float32, device="cpu",
                    layer_kv=[(1, 2), (1, 2)], sliding_layers=(1,),
                    sliding_window=WINDOW, n_sliding_pages=sliding_pages)
+
+
+def plain_arena(pages=64):
+    return KVArena(n_layers=1, n_pages=pages, page_tokens=16, n_kv=1, d_head=2,
+                   dtype=torch.float32, device="cpu")
 
 
 def test_window_origin_and_trim():
@@ -54,7 +58,7 @@ def test_window_origin_and_trim():
     assert arena.free_pages == 64
 
 
-def test_page_costs_use_the_tighter_pool():
+def test_page_costs_allocation_temporaries_and_resize():
     arena = cpu_arena(pages=64, sliding_pages=16)     # ratio 4
     # a short document is priced by the sliding pool: 2 pages x 4
     assert arena.page_cost(20) == 8
@@ -68,8 +72,7 @@ def test_page_costs_use_the_tighter_pool():
     assert arena.held_cost(key) == 28
     arena.trim_window(key)
     assert arena.held_cost(key) == 12
-    plain = KVArena(n_layers=1, n_pages=8, page_tokens=16, n_kv=1, d_head=2,
-                    dtype=torch.float32, device="cpu")
+    plain = plain_arena(pages=8)
     assert not plain.has_sliding
     assert plain.page_cost(100) == 7 and plain.page_cost(100, 100) == 7
     # without a sliding pool a trim releases nothing
@@ -77,8 +80,6 @@ def test_page_costs_use_the_tighter_pool():
     plain.trim_window(key)
     assert plain.held_cost(key) == 7
 
-
-def test_alloc_rollback_temporaries_and_resize():
     # 4 sliding pages hold 64 rows; a 100-row key needs 7 in each pool
     arena = cpu_arena(pages=64, sliding_pages=4)
     free = arena.accounting.free_pages
@@ -102,23 +103,64 @@ def test_alloc_rollback_temporaries_and_resize():
     arena.resize(32, 8)     # a no-op at the same sizes
 
 
-def test_filter_admission_credits_a_trim():
-    sched = FilterAdmission([100], [10], 200, arena_pages=64, page_tokens=16,
-                            page_cost=lambda tokens, base=None: (
-                                28 if base is None else 12))
-    assert sched.next_chunk() == [(0, 0, True)]
-    assert sched.free_pages == 64 - 28
-    sched.trim(0, 16)
-    assert sched.free_pages == 64 - 12
-    assert sched.resident[0] == 12
-    with pytest.raises(ValueError):
-        sched.trim(0, -1)
-    # a kept survivor holds its trimmed cost: nothing more comes back
-    sched.report(0, 0, True, release=False)
-    assert sched.free_pages == 52
+def test_holds_and_the_window_floor():
+    arena = cpu_arena(pages=64, sliding_pages=32)
+    parent, child = ("d", 0), ("d", 1)
+    arena.activate(parent, 100, capacity_tokens=110, base_tokens=100)
+    arena.hold(parent, 1)
+    # a borrower sharing 48 tokens reads the window from row 16 on
+    arena.keep_window(parent, 48)
+    arena.trim_window(parent)
+    assert arena.sliding_start(parent) == 16
+    # freed while held: the pages stay, and retention cannot evict it
+    assert arena.free_key(parent) == 0
+    assert arena.is_resident(parent) and arena.can_borrow(parent, 48)
+    arena.activate(child, 60, capacity_tokens=70, base_tokens=60,
+                   borrow=(parent, 48))
+    arena.release(parent)
+    assert not arena.is_resident(parent)
+    arena.free_key(child)
+    assert arena.free_pages == 64
+
+    # a retained held key is passed over by eviction until its holds go
+    arena.activate(parent, 100, capacity_tokens=110, base_tokens=100)
+    arena.hold(parent, 2)
+    arena.retain(parent, 100)
+    assert arena.evict_retained(64) == ()
+    assert arena.drop_holds([parent])
+    assert arena.evict_retained(64) == (parent,)
+    assert arena.free_pages == 64
+
+    arena.activate(parent, 100, capacity_tokens=110, base_tokens=100)
+    arena.hold(parent, 1)
+    arena.keep_window(parent, 48)
+    arena.trim_window(parent)
+    assert arena.sliding_start(parent) == 16
+    arena.activate(child, 60, capacity_tokens=70, base_tokens=60,
+                   borrow=(parent, 48))
+    borrowed = arena.owned_sliding_pages(child)[:2]
+    # the last borrower is in: the parent keeps only its own window
+    arena.release(parent)
+    assert arena.is_resident(parent)
+    assert arena.sliding_start(parent) == 64
+    assert arena.owned_sliding_pages(child)[:2] == borrowed
+    arena.free_key(child)
+    arena.free_key(parent)
+    assert arena.free_pages == 64
+
+    # a key still to run its pass trims after it, without the floor
+    arena.activate(parent, 100, capacity_tokens=110, base_tokens=100)
+    arena.hold(parent, 2)
+    arena.keep_window(parent, 48)
+    assert arena.drop_holds([parent])
+    assert arena.sliding_start(parent) == 0
+    arena.trim_window(parent)
+    assert arena.sliding_start(parent) == 64
+    arena.free_key(parent)
+    assert arena.free_pages == 64
 
 
-def test_pack_chunk_builds_both_pools(monkeypatch):
+def test_pack_chunk_builds_both_pools_and_reads_borrowed_pages(monkeypatch):
     cpu_staging(monkeypatch)
     arena = cpu_arena(pages=64, sliding_pages=32)
     key = ("d", 0)
@@ -170,3 +212,216 @@ def test_pack_chunk_builds_both_pools(monkeypatch):
         arena.free_key(temp)
     arena.free_key(key)
     assert arena.free_pages == 64
+
+    arena = plain_arena()
+    parent, child = ("d", 0), ("d", 1)
+    tail = [500]
+    arena.activate(parent, 100, capacity_tokens=110, base_tokens=100)
+    # the child shares 64 tokens (4 pages) and adds 30 of its own
+    arena.activate(child, 94, capacity_tokens=104, base_tokens=94,
+                   borrow=(parent, 64))
+    assert arena.owned_pages(child)[:4] == arena.owned_pages(parent)[:4]
+    chunk = loop.pack_chunk(
+        torch, arena,
+        [dict(key=parent, prefix=doc, f=100, suffixes=[tail]),
+         dict(key=child, prefix=doc[64:94], start=64, f=94, suffixes=[tail])],
+        attention_mode="unified")
+    assert chunk.fresh_keys == (parent, child)
+    assert chunk.tokens == 101 + 31
+    positions = chunk.positions.tolist()
+    assert positions[:101] == list(range(101))
+    assert positions[101:] == list(range(64, 95))
+    unified = chunk.meta["unified"]
+    assert unified["used"].tolist() == [101, 95]
+    table = unified["table"].tolist()
+    assert table[1][:4] == table[0][:4]
+    # the child's rows land after the borrowed pages, in its own pages
+    dst = unified["dst"].tolist()
+    assert dst[101:] == arena.capacity_rows(child)[64:95].tolist()
+    assert arena.capacity_rows(child)[:64].tolist() == \
+        arena.capacity_rows(parent)[:64].tolist()
+    # under tree attention without a read_key, the fresh rows read the
+    # child's own first 64 rows (the borrowed pages) and the suffix
+    # reads all 94
+    chunk = loop.pack_chunk(
+        torch, arena,
+        [dict(key=child, prefix=doc[64:94], start=64, f=94,
+              suffixes=[tail, [501]])],
+        attention_mode="tree")
+    reads = chunk.meta["reads"]
+    assert reads["used"].tolist() == [64, 94]
+    assert reads["cu_q"].tolist() == [0, 30, 32]
+    assert chunk.meta["cu_a"].tolist() == [0, 30, 31, 32]
+    arena.free_key(parent)
+    arena.free_key(child)
+    assert arena.free_pages == 64
+
+    arena = plain_arena()
+    parent, a, b = ("d", 0), ("d", 1), ("d", 2)
+    arena.activate(parent, 100, capacity_tokens=110, base_tokens=100)
+    # two siblings share 64 tokens (4 pages) of the parent
+    arena.activate(a, 74, capacity_tokens=84, base_tokens=74,
+                   borrow=(parent, 64))
+    arena.activate(b, 70, capacity_tokens=80, base_tokens=70,
+                   borrow=(parent, 64))
+    chunk = loop.pack_chunk(
+        torch, arena,
+        [dict(key=parent, prefix=doc, f=100, suffixes=[tail]),
+         dict(key=a, prefix=doc[64:74], start=64, read_key=parent, f=74,
+              suffixes=[tail], write_suffix_tokens=1),
+         dict(key=b, prefix=doc[64:70], start=64, read_key=parent, f=70,
+              suffixes=[tail], write_suffix_tokens=1)],
+        attention_mode="tree")
+    assert chunk.fresh_keys == (parent, a, b)
+    # call A: the parent's prefix, its tail, then each sibling's
+    # prefix and tail as one causal segment
+    assert chunk.meta["cu_a"].tolist() == [0, 100, 101, 112, 119]
+    reads = chunk.meta["reads"]
+    # call B: the parent's tail reads its 100 rows; both siblings' 18
+    # rows read the parent's 64 shared positions in one sequence
+    assert reads["cu_q"].tolist() == [0, 1, 19]
+    assert reads["used"].tolist() == [100, 64]
+    assert reads["max_q"] == 18
+    assert reads["rows"].tolist() == [100] + list(range(101, 119))
+    table = reads["table"].tolist()
+    assert table[1][:4] == table[0][:4]
+    # the siblings' prefixes and kept tails write their own pages after
+    # the borrowed ones
+    dst = chunk.meta["kv_dst"].tolist()
+    assert dst[100:110] == arena.capacity_rows(a)[64:74].tolist()
+    assert dst[110:111] == arena.capacity_rows(a)[74:75].tolist()
+    assert dst[111:117] == arena.capacity_rows(b)[64:70].tolist()
+    assert dst[117:118] == arena.capacity_rows(b)[70:71].tolist()
+    for key in (parent, a, b):
+        arena.free_key(key)
+    assert arena.free_pages == 64
+
+
+def test_borrowing_in_the_arena_and_can_borrow(monkeypatch):
+    cpu_staging(monkeypatch)
+    arena = plain_arena(pages=8)
+    parent, other, child = ("d", 0), ("d", 1), ("d", 2)
+    assert arena.activate(parent, 64, base_tokens=64)          # 4 pages
+    assert arena.activate(other, 48, base_tokens=48)           # 3 pages
+    arena.retain(other, 48)
+    # the child needs 3 own pages for 48 tokens past its 32 borrowed:
+    # only 1 is free, so the retained key goes
+    assert arena.activate(child, 80, base_tokens=80, borrow=(parent, 32))
+    assert not arena.is_resident(other)
+    assert arena.evicted_keys == 1
+    assert arena.owned_pages(child)[:2] == arena.owned_pages(parent)[:2]
+    assert arena.free_pages == 8 - 4 - 3
+    arena.free_key(parent)
+    arena.free_key(child)
+    assert arena.free_pages == 8
+
+    arena = cpu_arena(pages=64, sliding_pages=32)
+    parent, child = ("d", 0), ("d", 1)
+    doc = list(range(100))
+    tail = [500]
+    # the parent stays untrimmed until the child has borrowed
+    arena.activate(parent, 100, capacity_tokens=110, base_tokens=100)
+    # the child shares 64 tokens: its sliding window starts at
+    # origin(64) = 32 and reads the parent's sliding pages for [32, 64)
+    arena.activate(child, 94, capacity_tokens=104, base_tokens=94,
+                   borrow=(parent, 64))
+    assert arena.sliding_start(child) == 32
+    assert arena.owned_pages(child)[:4] == arena.owned_pages(parent)[:4]
+    assert arena.owned_sliding_pages(child)[:2] == \
+        arena.owned_sliding_pages(parent)[2:4]
+    # the child's sliding pages: 2 borrowed + pages for [64, 104) = 3 own
+    assert len(arena.owned_sliding_pages(child)) == 5
+    chunk = loop.pack_chunk(
+        torch, arena,
+        [dict(key=parent, prefix=doc, f=100, suffixes=[tail]),
+         dict(key=child, prefix=doc[64:94], start=64, f=94, suffixes=[tail])],
+        attention_mode="unified")
+    sliding = chunk.meta["unified"]["sliding"]
+    assert sliding["used"].tolist() == [101, 95 - 32]
+    table = sliding["table"].tolist()
+    full = chunk.meta["unified"]["table"].tolist()
+    assert table[1][:2] == table[0][2:4]
+    assert full[1][:4] == full[0][:4]
+    # the child's rows land after the borrowed window in its own pages
+    dst = sliding["dst"].tolist()
+    assert dst[101:] == arena.capacity_rows_sliding(child)[32:63].tolist()
+    # the parent trims once the child holds the window; the child's
+    # borrowed pages survive, and its own trim drops them first
+    freed = arena.trim_window(parent)
+    assert freed > 0 and arena.sliding_start(parent) == 64
+    assert arena.owned_sliding_pages(child)[:2] == \
+        arena.owned_sliding_pages(parent)[:0] + arena.owned_sliding_pages(child)[:2]
+    assert arena.trim_window(child) > 0      # origin(94) = 48: one page
+    assert arena.sliding_start(child) == 48
+    assert len(arena.owned_sliding_pages(child)) == 4
+    arena.free_key(parent)
+    arena.free_key(child)
+    assert arena.free_pages == 64
+
+    # a parent trimmed past the child's window refuses the borrow
+    arena.activate(parent, 100, capacity_tokens=110, base_tokens=100)
+    arena.trim_window(parent)                 # keeps rows from 64
+    with pytest.raises(ValueError, match="trimmed"):
+        arena.activate(child, 94, capacity_tokens=104, base_tokens=94,
+                       borrow=(parent, 64))
+    assert not arena.is_resident(child)
+    arena.free_key(parent)
+    assert arena.free_pages == 64
+
+    arena = cpu_arena(pages=64, sliding_pages=32)
+    root, middle = ("d", 0), ("d", 1)
+    arena.activate(root, 100, capacity_tokens=110, base_tokens=100)
+    # a child sharing most of the root borrows: the root is untrimmed
+    assert arena.can_borrow(root, 96)
+    arena.activate(middle, 120, capacity_tokens=130, base_tokens=120,
+                   borrow=(root, 96))
+    # its sliding pages start at origin(96) = 64, so a child sharing
+    # only the first 16 tokens cannot get the window below them
+    assert arena.sliding_start(middle) == 64
+    assert not arena.can_borrow(middle, 16)
+    assert arena.can_borrow(middle, 112)
+    # the root still has them; a shared length past its tokens is refused
+    assert arena.can_borrow(root, 16)
+    assert not arena.can_borrow(root, 112)
+    assert not arena.can_borrow(("d", 9), 16)
+    arena.trim_window(root)
+    assert not arena.can_borrow(root, 16)
+    arena.free_key(middle)
+    arena.free_key(root)
+    assert arena.free_pages == 64
+
+
+def test_join_anchor_keeps_its_window_for_a_later_child(monkeypatch):
+    from types import SimpleNamespace
+
+    from fakes import fake_pipeline, fake_torch
+
+    from quail.execution.tokens import prefix_tree
+
+    cpu_staging(monkeypatch)
+    # anchor 1 shares 80 tokens with anchor 0, anchor 2 only the first
+    # 32; anchor 2 borrows from anchor 0, whose window below row 32
+    # must outlive the first chunk
+    prefixes = [[1] * 96, [1] * 80 + [2] * 16, [1] * 32 + [3] * 64]
+    tree = prefix_tree(prefixes, 16)
+    assert tree.parent == [None, 0, 0] and tree.shared == [0, 80, 32]
+
+    def forward(chunk):
+        return [0] * sum(n for _, n in chunk.layout)
+
+    # real tensors, fake CUDA events
+    fake = fake_torch()
+    cpu = SimpleNamespace(**{n: getattr(torch, n) for n in dir(torch)
+                             if not n.startswith("_")})
+    cpu.cuda, cpu.inference_mode = fake.cuda, fake.inference_mode
+    answers = SimpleNamespace(submit=lambda v: v, result=lambda v: v, dtype=None)
+    arena = cpu_arena(pages=64, sliding_pages=32)
+    stats = {}
+    _, _, tokens = loop.run_join(
+        cpu, arena, fake_pipeline(forward_chunk=forward), answers,
+        prefixes, [[[9], [10]]], 130, stage_frames=[[5]],
+        anchor_keys=[("a", d) for d in range(3)], prefix_tree=tree,
+        stats=stats)
+    assert stats["borrowed_tokens"] == 80 + 32
+    assert tokens == 96 + 16 + 64 + 3 * 3
+    assert not arena.accounting.owned

@@ -51,8 +51,7 @@ def wait_done(store, query_id, timeout=30.0):
     return status
 
 
-def test_in_process_run_saves_plan_progress_and_a_readable_result(
-        store, tmp_path):
+def test_in_process_run_saves_a_readable_and_verified_result(store, tmp_path):
     final = scheduler_for(store, tmp_path).run_one(submit(store, tmp_path))
     assert final.state == "succeeded"
     assert final.progress["label"] == "filter (2 stages)"
@@ -77,8 +76,28 @@ def test_in_process_run_saves_plan_progress_and_a_readable_result(
                   if not passed) == [0, 0, 1, 1]
     assert final.progress["answers_saved"] == 1
 
+    # verification rejects a missing or short result file
+    verified = tmp_path / "verified"
+    verified.mkdir()
+    table = pa.table({"r.id": ["r0", "r3"]})
+    result = quail.QueryResult.from_table(table, {"backend": "quail"})
+    join_answers = pa.table({"r": [0], "p": [1], "answer": [True]})
+    result.answer_tables = {"joins": {0: join_answers}}
+    manifest = artifacts.write_result(result, verified)
+    artifacts.verify_result(verified, manifest)
+    loaded = artifacts.load_result(verified, manifest)
+    assert loaded.to_rows() == [("r0",), ("r3",)]
+    assert loaded.answer_tables["joins"][0].equals(join_answers)
+    with pytest.raises(ValueError, match="holds 2 rows"):
+        artifacts.verify_result(verified, {**manifest, "rows": 3})
+    (verified / "result.arrow").unlink()
+    with pytest.raises(FileNotFoundError):
+        artifacts.verify_result(verified, manifest)
+    assert not list(verified.glob("*.tmp"))
 
-def test_failed_and_early_cancelled_runs_are_saved(store, tmp_path, monkeypatch):
+
+def test_failed_and_cancelled_runs_are_saved_and_not_killed(
+        store, tmp_path, monkeypatch):
     executor = InProcessExecutor(server_fakes.hooks)
     scheduler = scheduler_for(store, tmp_path, executor)
     bad = scheduler.run_one(
@@ -107,9 +126,6 @@ def test_failed_and_early_cancelled_runs_are_saved(store, tmp_path, monkeypatch)
         "failed", "PublishError")
     assert "disk full" in unpublished.error["message"]
 
-
-def test_a_finished_execution_is_not_killed_while_it_reports_done(
-        store, tmp_path):
     stops = []
 
     class Execution:
@@ -137,26 +153,46 @@ def test_a_finished_execution_is_not_killed_while_it_reports_done(
     assert stops == [], "killing it would throw away the loaded model"
 
 
-def test_verify_rejects_a_missing_or_short_result_file(tmp_path):
-    table = pa.table({"r.id": ["r0", "r3"]})
-    result = quail.QueryResult.from_table(table, {"backend": "quail"})
-    join_answers = pa.table({"r": [0], "p": [1], "answer": [True]})
-    result.answer_tables = {"joins": {0: join_answers}}
-    manifest = artifacts.write_result(result, tmp_path)
-    artifacts.verify_result(tmp_path, manifest)
-    loaded = artifacts.load_result(tmp_path, manifest)
-    assert loaded.to_rows() == [("r0",), ("r3",)]
-    assert loaded.answer_tables["joins"][0].equals(join_answers)
-    with pytest.raises(ValueError, match="holds 2 rows"):
-        artifacts.verify_result(tmp_path, {**manifest, "rows": 3})
-    (tmp_path / "result.arrow").unlink()
-    with pytest.raises(FileNotFoundError):
-        artifacts.verify_result(tmp_path, manifest)
-    assert not list(tmp_path.glob("*.tmp"))
-
-
-def test_child_process_execution_stops_on_timeout_and_the_next_query_runs(
+def test_executors_switch_models_skip_warm_loads_and_stop_on_timeout(
         store, tmp_path):
+    for child in (False, True):
+        executor = (ChildProcessExecutor("server_fakes:hooks") if child
+                    else InProcessExecutor(server_fakes.hooks))
+        scheduler = scheduler_for(store, tmp_path, executor)
+        seen = {}
+
+        def record():
+            for status in store.list_recent():
+                phases = seen.setdefault(status.id, [])
+                if not phases or phases[-1] != status.phase["name"]:
+                    phases.append(status.phase["name"])
+
+        store.add_listener(record)
+        try:
+            first = submit(store, tmp_path)
+            assert scheduler.run_one(first).state == "succeeded", child
+            assert executor._loaded_model == "qwen3-4b-fp8", child
+            pid = executor._process.pid if child else None
+            second = submit(store, tmp_path)
+            assert scheduler.run_one(second).state == "succeeded", child
+            if child:
+                assert executor._process.pid == pid, "same model, same child"
+            other = submit(store, tmp_path,
+                           config={**server_fakes.CONFIG, "model": "qwen3-32b-fp8"})
+            assert scheduler.run_one(other).state == "succeeded", child
+            assert executor._loaded_model == "qwen3-32b-fp8", child
+            if child:
+                assert executor._process.pid != pid, "another model, a new child"
+        finally:
+            executor.close()
+            store.remove_listener(record)
+
+        start = ["queued", "resolving_inputs", "planning"]
+        end = ["executing", "succeeded"]
+        assert seen[first.id] == [*start, "loading_model", *end], child
+        assert seen[second.id] == [*start, *end], child
+        assert seen[other.id] == [*start, "switching_model", *end], child
+
     assert load_hooks(None) is None
     assert load_hooks("server_fakes:hooks") is server_fakes.hooks
     with pytest.raises(TypeError):
@@ -176,47 +212,7 @@ def test_child_process_execution_stops_on_timeout_and_the_next_query_runs(
         scheduler.stop()
 
 
-@pytest.mark.parametrize("child", [False, True])
-def test_model_changes_switch_the_executor_and_warm_runs_skip_loading(
-        store, tmp_path, child):
-    executor = (ChildProcessExecutor("server_fakes:hooks") if child
-                else InProcessExecutor(server_fakes.hooks))
-    scheduler = scheduler_for(store, tmp_path, executor)
-    seen = {}
-
-    def record():
-        for status in store.list_recent():
-            phases = seen.setdefault(status.id, [])
-            if not phases or phases[-1] != status.phase["name"]:
-                phases.append(status.phase["name"])
-
-    store.add_listener(record)
-    try:
-        first = submit(store, tmp_path)
-        assert scheduler.run_one(first).state == "succeeded"
-        assert executor._loaded_model == "qwen3-4b-fp8"
-        pid = executor._process.pid if child else None
-        second = submit(store, tmp_path)
-        assert scheduler.run_one(second).state == "succeeded"
-        if child:
-            assert executor._process.pid == pid, "same model, same child"
-        other = submit(store, tmp_path,
-                       config={**server_fakes.CONFIG, "model": "qwen3-32b-fp8"})
-        assert scheduler.run_one(other).state == "succeeded"
-        assert executor._loaded_model == "qwen3-32b-fp8"
-        if child:
-            assert executor._process.pid != pid, "another model, a new child"
-    finally:
-        executor.close()
-
-    start = ["queued", "resolving_inputs", "planning"]
-    end = ["executing", "succeeded"]
-    assert seen[first.id] == [*start, "loading_model", *end]
-    assert seen[second.id] == [*start, *end]
-    assert seen[other.id] == [*start, "switching_model", *end]
-
-
-def test_a_stale_job_cannot_remove_the_next_jobs_sinks():
+def test_progress_sinks_labels_and_quiet_mode(capsys):
     first, second = Mock(), Mock()
     progress.set_answer_sink(first)
     progress.set_answer_sink(second)
@@ -230,8 +226,6 @@ def test_a_stale_job_cannot_remove_the_next_jobs_sinks():
     progress.set_progress_sink(None)
     assert progress._SINK is None
 
-
-def test_progress_labels_and_quiet_mode(capsys):
     progress.say("shown")
     with progress.quiet():
         progress.say("hidden")

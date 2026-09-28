@@ -286,50 +286,48 @@ def test_benchmark_results_and_scoring(tmp_path):
         run_output(quail_result, text_plan, CORPUS)
 
 
-@pytest.mark.parametrize(
-    "backend", ["quail", "stock_vllm", "pipelined_vllm", "pipelined_sglang"])
-def test_benchmark_query_prompts_and_labels(backend):
-    corpus, truth = fever_truth()
-    spec = get_query("FEV-9")
-    plan = read_plan(spec.plan)
-    answer = answer_oracle(truth, corpus)
-    with quail.Session(
-        _config(backend), tokenizer=lambda text: list(text.encode("utf-8"))
-    ) as session:
-        for name, table in corpus.items():
-            session.register(name, DocumentProvider.from_table(table, id_col="id"))
-        query = build_query(session, spec)
-        assert not isinstance(query.plan(), Refusal)
-        operators = query.logical.operators()
-        filters, joins = operators.filters, operators.joins
-        tables = {relation.alias: relation.table for relation in plan.relations}
-        assert [scan.alias for scan in operators.scans] == list(tables)
-        assert {alias: [p.prompt.template for p in chain]
-                for alias, chain in filters.items()} == {
-            alias: [
-                quail.bind_prompt(item.prompt, (quail.ColumnRef(
-                    alias, tables[alias], item.column),)).template
-                for item in plan.filters if item.alias == alias]
-            for alias in tables if any(
-                item.alias == alias for item in plan.filters)}
-        assert [tuple(arg.alias for arg in join.prompt.args)
-                for join in joins] == [join.aliases for join in plan.joins]
-        # c0 is about a person and e0 supports it; c2 is not about a person
-        assert answer(filters["c1"][0].prompt, {"c1": 0}) is True
-        assert answer(filters["c1"][0].prompt, {"c1": 2}) is False
-        assert answer(joins[0].prompt, {"c1": 0, "e1": 0}) is True
-        assert answer(joins[0].prompt, {"c1": 0, "e1": 1}) is False
-        # the same labels drive the speed of light estimate
-        estimate = quail.speed_of_light_estimate(query, answer)
-        assert estimate.post_filter_counts == {
-            "c1": 2, "e1": 2, "c2": 2, "e2": 2}
-        assert len(estimate.join_stages) == 3
-        assert queries(session)["FEV-9"][0] == spec.description
-        # only the FEVER tables are registered
-        assert all(query_id.startswith("FEV-") for query_id in queries(session))
-
-
-def test_benchmark_renders_the_same_raw_prompt_as_quail():
+def test_benchmark_query_prompts_labels_and_raw_rendering():
+    for backend in ("quail", "stock_vllm", "pipelined_vllm", "pipelined_sglang"):
+        corpus, truth = fever_truth()
+        spec = get_query("FEV-9")
+        plan = read_plan(spec.plan)
+        answer = answer_oracle(truth, corpus)
+        with quail.Session(
+            _config(backend), tokenizer=lambda text: list(text.encode("utf-8"))
+        ) as session:
+            for name, table in corpus.items():
+                session.register(name, DocumentProvider.from_table(table, id_col="id"))
+            query = build_query(session, spec)
+            assert not isinstance(query.plan(), Refusal), backend
+            operators = query.logical.operators()
+            filters, joins = operators.filters, operators.joins
+            tables = {relation.alias: relation.table for relation in plan.relations}
+            assert [scan.alias for scan in operators.scans] == list(tables), backend
+            assert {alias: [p.prompt.template for p in chain]
+                    for alias, chain in filters.items()} == {
+                alias: [
+                    quail.bind_prompt(item.prompt, (quail.ColumnRef(
+                        alias, tables[alias], item.column),)).template
+                    for item in plan.filters if item.alias == alias]
+                for alias in tables if any(
+                    item.alias == alias for item in plan.filters)}, backend
+            assert [tuple(arg.alias for arg in join.prompt.args)
+                    for join in joins] == [join.aliases for join in plan.joins]
+            # c0 is about a person and e0 supports it; c2 is not about a person
+            assert answer(filters["c1"][0].prompt, {"c1": 0}) is True, backend
+            assert answer(filters["c1"][0].prompt, {"c1": 2}) is False, backend
+            assert answer(joins[0].prompt, {"c1": 0, "e1": 0}) is True, backend
+            assert answer(joins[0].prompt, {"c1": 0, "e1": 1}) is False, backend
+            # the same labels drive the speed of light estimate
+            estimate = quail.speed_of_light_estimate(query, answer)
+            assert estimate.post_filter_counts == {
+                "c1": 2, "e1": 2, "c2": 2, "e2": 2}, backend
+            assert len(estimate.join_stages) == 3, backend
+            assert queries(session)["FEV-9"][0] == spec.description, backend
+            # only the FEVER tables are registered
+            assert all(query_id.startswith("FEV-")
+                       for query_id in queries(session)), backend
+    # the benchmark renders the same raw prompt text as Quail
     turn = QWEN3_4B_FP8.turn
     for spec in PREDICATES:
         left = quail.ColumnRef("left", spec.left_table, spec.left_column)

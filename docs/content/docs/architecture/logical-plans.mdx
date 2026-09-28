@@ -195,7 +195,9 @@ class LogicalOptimizerRule(Protocol):
 
 A rule gets the whole plan and returns a new root, or `None` if
 nothing changed. `apply_logical_rules` runs the rules in order and
-repeats until a pass changes nothing, up to `MAX_PASSES`.
+repeats until a pass leaves the plan unchanged or four passes have
+run. The limit is `MAX_PASSES` in `logical_optimizer.py`. See
+[rule order and precedents](/docs/extending/operators#optional-logical-and-physical-rules).
 
 Quail includes one built-in logical rule:
 

@@ -65,11 +65,10 @@ interests you, open an issue and we will help you get started.
   These require decode (generating multiple tokens), which the
   current engine does not do. See
   [Custom operators](/docs/extending/operators).
-- **Automatic prefix caching across rows.** Quail currently reuses
-  KV only when the same document appears again in the query. vLLM's
-  automatic prefix caching can reuse KV across different rows that
-  share a token prefix (e.g., agent traces from the same run). The
-  lookup needs to stay cheap at AI-SQL request volumes.
+- **Assign documents to GPUs for prefix reuse.** Each GPU can reuse
+  KV only from documents on that GPU. Grouping documents with common
+  prefixes on the same GPU could increase reuse. The assignment must
+  also keep the work balanced across GPUs.
 
 ### Harder
 

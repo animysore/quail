@@ -9,7 +9,6 @@ import pytest
 from fakes import cpu_arena, fake_pipeline, fake_torch
 
 from quail.backends.quail.executor import loop, model
-from quail.backends.quail.executor.attention import JOIN_ATTENTION
 from quail.backends.quail.executor.model import answer_weights, retain_answer_head
 from quail.backends.quail.executor.readout import AnswerRows, AsyncAnswers, AsyncScores
 from quail.builtins import built_in_registry
@@ -29,7 +28,7 @@ def _model(torch, tied=False):
     return model
 
 
-def test_retained_answer_weights_and_embedding_ownership(torch):
+def test_retained_answer_weights_ownership_and_answer_rows(torch):
     for tied in [False, True]:
         model = _model(torch, tied)
         embedding = model.model.embed_tokens.weight
@@ -61,8 +60,7 @@ def test_retained_answer_weights_and_embedding_ownership(torch):
         retain_answer_head(torch, model, [])
     assert model.lm_head is original
 
-
-def test_answer_rows_preserve_scores_and_share_retained_weights(torch):
+    # answer rows preserve the scores and share the retained weights
     model = _model(torch)
     hidden = torch.tensor([[1, 2, -1, 0], [0, 1, 3, -2]], dtype=torch.bfloat16)
     full_scores = torch.nn.functional.linear(hidden, model.lm_head.weight)
@@ -111,7 +109,7 @@ def test_run_join_evicts_then_halves_a_chunk_that_does_not_fit(monkeypatch):
     # nothing retained to evict, so the two-group chunk ran as two chunks
     assert failed == [2] and len(evictions) == 1 and evictions[0] > 0
     assert sizes == [1, 1]
-    assert modes == {JOIN_ATTENTION}
+    assert modes == {"tree"}
     assert answers_out == [{0: [1], 1: [1]}]
 
 
@@ -122,7 +120,7 @@ def clear_model_paths():
     model.resolve_model_path.cache_clear()
 
 
-def test_model_files_are_resolved_once_per_revision(
+def test_model_files_are_resolved_once_and_cached_before_children_start(
         monkeypatch, tmp_path, clear_model_paths):
     calls = []
 
@@ -138,8 +136,7 @@ def test_model_files_are_resolved_once_per_revision(
     assert all(call["repo_id"] == "Qwen/model" for call in calls)
     assert "*.safetensors" in calls[0]["allow_patterns"]
 
-
-def test_model_files_cached_before_gpu_children_start(monkeypatch, tmp_path):
+    # the files are cached before the GPU children start
     from quail.backends.quail import worker
 
     events = []

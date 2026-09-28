@@ -44,6 +44,8 @@ class TokenView(Sequence):
 
 
 class TokenChain(Sequence):
+    """Token parts read in sequence without copying them."""
+
     def __init__(self, *parts):
         flattened = []
         for part in parts:
@@ -63,7 +65,10 @@ class TokenChain(Sequence):
 
     def __getitem__(self, index):
         if isinstance(index, slice):
-            return list(self)[index]
+            start, stop, step = index.indices(self._length)
+            if step != 1:
+                return list(self)[index]
+            return TokenChain(*self._sliced_parts(start, stop))
         if index < 0:
             index += self._length
         if not 0 <= index < self._length:
@@ -73,6 +78,19 @@ class TokenChain(Sequence):
                 return part[index]
             index -= len(part)
         raise IndexError(index)
+
+    def _sliced_parts(self, start, stop):
+        """The parts covering [start, stop), each sliced to it."""
+        parts = []
+        offset = 0
+        for part in self._parts:
+            end = offset + len(part)
+            if end > start and offset < stop:
+                parts.append(part[max(0, start - offset):stop - offset])
+            offset = end
+            if offset >= stop:
+                break
+        return parts
 
     @property
     def token_parts(self):
@@ -466,17 +484,108 @@ def shared_prefix_lengths(sequences) -> list[int]:
 
     The values sum to the tokens a prefix trie over the sequences
     saves: an execution with unlimited KV that computes every distinct
-    prefix once pays for each sequence only beyond its credited length.
+    prefix once pays for each sequence only beyond its shared length.
     The sum does not depend on the order the sequences are computed
-    in; the per sequence credit is the longest common prefix with the
-    lexicographic predecessor.
+    in; a sequence's shared length is the longest common prefix with
+    the lexicographic predecessor.
     """
-    order = sorted(range(len(sequences)),
-                   key=lambda index: tuple(sequences[index]))
-    credits = [0] * len(sequences)
-    previous = ()
+    return prefix_tree(sequences, 1).shared
+
+
+def _token_array(document):
+    """A document's token ids as an int32 array, without a Python list."""
+    import numpy as np
+
+    parts = getattr(document, "token_parts", (document,))
+    arrays = []
+    for part in parts:
+        if hasattr(part, "numpy"):
+            try:
+                arrays.append(np.asarray(part.numpy(), dtype=np.int32))
+                continue
+            except (TypeError, ValueError):
+                pass
+        arrays.append(np.asarray(list(part), dtype=np.int32))
+    if not arrays:
+        return np.empty(0, dtype=np.int32)
+    return arrays[0] if len(arrays) == 1 else np.concatenate(arrays)
+
+
+class PrefixTree:
+    """Which document each document borrows its KV prefix from.
+
+    Documents are visited in sorted token order. A document's shared
+    length is the tokens it has in common with its predecessor,
+    rounded down to a whole page and short of its last token, so it
+    can read those pages instead of computing them. Its parent is the
+    earliest document that computed those pages itself: the
+    predecessor, or an ancestor of the predecessor that borrowed at
+    least as much. Documents sharing
+    one prefix thus all borrow from the same parent, and a forward
+    pass can read that parent's pages once for all of them. A
+    document with nothing to borrow has parent None and shared 0.
+
+    Attributes:
+        order: Document positions in sorted token order; a parent
+            always comes before its children.
+        parent: Per document, the position it borrows from, or None.
+        shared: Per document, the borrowed tokens, a multiple of the
+            page size.
+    """
+
+    def __init__(self, order, parent, shared):
+        self.order = order
+        self.parent = parent
+        self.shared = shared
+
+    @property
+    def shared_tokens(self) -> int:
+        """Tokens the tree lets the engine read instead of compute."""
+        return sum(self.shared)
+
+
+def prefix_tree(documents, page_tokens: int) -> PrefixTree:
+    """Build the prefix tree of a document set.
+
+    Args:
+        documents: Token sequences, indexable by position.
+        page_tokens: Tokens per KV page; shares round down to it.
+    """
+    import numpy as np
+
+    n = len(documents)
+    try:
+        arrays = [_token_array(documents[i]) for i in range(n)]
+    except (TypeError, ValueError):
+        # tokens that are not integers (a test tokenizer's words)
+        arrays = [tuple(documents[i]) for i in range(n)]
+        keys = arrays
+        common = longest_common_prefix
+    else:
+        # big-endian bytes sort like the token ids they encode
+        keys = [a.astype(">i4").tobytes() for a in arrays]
+
+        def common(a, b):
+            limit = min(len(a), len(b))
+            differ = np.flatnonzero(a[:limit] != b[:limit])
+            return int(differ[0]) if len(differ) else limit
+    order = sorted(range(n), key=keys.__getitem__)
+    parent = [None] * n
+    shared = [0] * n
+    previous = None
     for index in order:
-        current = tuple(sequences[index])
-        credits[index] = longest_common_prefix(previous, current)
-        previous = current
-    return credits
+        if previous is not None:
+            # a document computes at least its last token, so a
+            # duplicate still packs a prefix of its own
+            lcp = min(common(arrays[previous], arrays[index]),
+                      max(len(arrays[index]) - 1, 0))
+            pages = lcp // page_tokens * page_tokens
+            if pages:
+                # climb while the ancestor borrowed these pages too
+                owner = previous
+                while parent[owner] is not None and shared[owner] >= pages:
+                    owner = parent[owner]
+                parent[index] = owner
+                shared[index] = pages
+        previous = index
+    return PrefixTree(order, parent, shared)

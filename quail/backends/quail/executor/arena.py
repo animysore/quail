@@ -32,14 +32,21 @@ from quail.progress import answer_sink
 
 
 class PageArena:
-    """Page accounting: a free list and per-document page lists."""
+    """Page accounting: a free list and per-document page lists.
+
+    A key may borrow the leading pages of another resident key's
+    prefix: it reads them and never writes them. A page returns to
+    the free list when its last holder frees it.
+    """
 
     def __init__(self, n_pages: int, page_tokens: int):
         self.n_pages = n_pages
         self.page_tokens = page_tokens
         self.free = list(range(n_pages - 1, -1, -1))    # stack
-        self.owned = {}       # key -> list of page ids
-        self.tokens = {}      # key -> resident token count
+        self.owned = {}       # key -> list of page ids it alone writes
+        self.borrowed = {}    # key -> leading page ids read from a parent
+        self.holds = [0] * n_pages    # page id -> keys holding it
+        self.tokens = {}      # key -> resident token count, borrowed included
         self.pinned = set()    # current operators depend on these keys
         self._retained_sizes = {}
         self._retained_pages = 0
@@ -53,32 +60,83 @@ class PageArena:
     def pages_needed(self, tokens: int) -> int:
         return -(-tokens // self.page_tokens)
 
-    def alloc(self, key, tokens: int, capacity_tokens: int | None = None):
-        """The document's pages, or None when the free list is short.
+    def alloc(self, key, tokens: int, capacity_tokens: int | None = None,
+              borrowed=()):
+        """The document's own pages, or None when the free list is short.
 
-        The admission scheduler treats None as "wait".
+        The admission scheduler treats None as "wait". borrowed are
+        resident pages of another key the new key reads as its
+        leading pages (see shared_pages); tokens and capacity_tokens
+        count them.
         """
         if key in self.owned:
             raise KeyError(f"{key!r} already resident")
         capacity_tokens = tokens if capacity_tokens is None else capacity_tokens
         if capacity_tokens < tokens:
             raise ValueError("capacity_tokens must cover logical tokens")
-        need = self.pages_needed(capacity_tokens)
+        borrowed = list(borrowed)
+        if len(borrowed) * self.page_tokens > tokens:
+            raise ValueError("a key cannot borrow past its own tokens")
+        need = self.pages_needed(capacity_tokens) - len(borrowed)
         if need > len(self.free):
             return None
         pages = [self.free.pop() for _ in range(need)]
         self.owned[key] = pages
+        self.borrowed[key] = borrowed
         self.tokens[key] = tokens
+        for page in borrowed + pages:
+            self.holds[page] += 1
         return pages
 
+    def shared_pages(self, parent, shared: int, start: int = 0) -> list:
+        """The parent's pages for its tokens [start, shared), to borrow.
+
+        Both bounds are whole pages. The parent's first page must hold
+        token `start` or an earlier one.
+        """
+        if (shared - start) % self.page_tokens or start % self.page_tokens:
+            raise ValueError("a borrowed prefix is a whole number of pages")
+        if parent not in self.owned:
+            raise KeyError(f"borrow parent {parent!r} is not resident")
+        if shared > self.tokens[parent]:
+            raise ValueError(f"{parent!r} holds fewer tokens than borrowed")
+        first = start // self.page_tokens
+        return self.table_pages(parent)[first:shared // self.page_tokens]
+
+    def drop_leading(self, key, pages: int) -> int:
+        """Drop a key's first pages, borrowed ones first; returns pages freed."""
+        borrowed = self.borrowed[key]
+        from_borrowed = min(pages, len(borrowed))
+        dropped = borrowed[:from_borrowed] + self.owned[key][:pages - from_borrowed]
+        self.borrowed[key] = borrowed[from_borrowed:]
+        self.owned[key] = self.owned[key][pages - from_borrowed:]
+        return self.release_pages(dropped)
+
+    def table_pages(self, key) -> list:
+        """The pages a key's block table reads: borrowed, then its own."""
+        return self.borrowed[key] + self.owned[key]
+
+    def borrowed_tokens(self, key) -> int:
+        return len(self.borrowed[key]) * self.page_tokens
+
+    def release_pages(self, pages) -> int:
+        """Drop one hold on each page; returns how many went free."""
+        freed = 0
+        for page in pages:
+            self.holds[page] -= 1
+            if not self.holds[page]:
+                self.free.append(page)
+                freed += 1
+        return freed
+
     def free_key(self, key) -> int:
-        """Return a document's pages to the free list."""
+        """Drop a document's pages; returns the pages that went free."""
         pages = self.owned.pop(key)
+        borrowed = self.borrowed.pop(key)
         self.tokens.pop(key)
         self.pinned.discard(key)
         self._forget_retained(key)
-        self.free.extend(pages)
-        return len(pages)
+        return self.release_pages(borrowed + pages)
 
     def pin(self, key) -> None:
         """Protect a resident key while an operator uses it."""
@@ -99,16 +157,22 @@ class PageArena:
         self.pinned.discard(key)
         prefix_tokens = self.tokens[key]
         self._forget_retained(key)
+        # the pages evicting the key would free: those it alone holds
+        # now; a child freed later leaves more, so the count is a
+        # lower bound, and admission short of pages evicts anyway
+        pages = sum(1 for page in self.table_pages(key) if self.holds[page] == 1)
         self.retained[key] = prefix_tokens
-        self._retained_sizes[key] = len(self.owned[key])
-        self._retained_pages += len(self.owned[key])
+        self._retained_sizes[key] = pages
+        self._retained_pages += pages
         self._retention_version += 1
         version = self._retention_version
         self._retained_versions[key] = version
-        pages = len(self.owned[key])
         if priority is None:
-            priority = (self.retention_policy.priority(key, prefix_tokens, pages)
-                        if self.retention_policy else (prefix_tokens / pages,))
+            # a key whose pages its children all share frees none alone
+            priority = (self.retention_policy.priority(
+                key, prefix_tokens, max(1, pages))
+                if self.retention_policy
+                else (prefix_tokens / max(1, pages),))
         heapq.heappush(
             self._retained_heap,
             (priority, version, key, pages, prefix_tokens),
@@ -125,42 +189,59 @@ class PageArena:
         for key in keys:
             self.retain(key)
 
-    def pop_retained_victim(self):
-        """Remove the retained prefix with the lowest planned reuse priority."""
+    def pop_retained_victim(self, keep=frozenset()):
+        """Remove the retained prefix with the lowest planned reuse priority.
+
+        Keys in keep stay retained and are passed over.
+        """
+        passed = []
+        victim = None
         while self._retained_heap:
-            _, version, key, pages, prefix_tokens = heapq.heappop(
-                self._retained_heap)
+            entry = heapq.heappop(self._retained_heap)
+            _, version, key, pages, prefix_tokens = entry
             if self._retained_versions.get(key) != version:
                 continue
+            if key in keep:
+                passed.append(entry)
+                continue
             self._forget_retained(key)
-            return key, pages, prefix_tokens
-        return None
+            victim = key, pages, prefix_tokens
+            break
+        for entry in passed:
+            heapq.heappush(self._retained_heap, entry)
+        return victim
 
     def rewind(self, key, tokens: int) -> int:
         """Keep the first tokens and return unused trailing pages."""
         if key not in self.owned:
             raise KeyError(key)
-        if tokens < 0 or tokens > len(self.owned[key]) * self.page_tokens:
-            raise ValueError("rewind tokens exceed the resident capacity")
-        keep = self.pages_needed(tokens)
+        borrowed = self.borrowed_tokens(key)
+        capacity = borrowed + len(self.owned[key]) * self.page_tokens
+        if tokens < borrowed or tokens > capacity:
+            raise ValueError("rewind tokens leave the resident capacity")
+        keep = self.pages_needed(tokens) - len(self.borrowed[key])
         released = self.owned[key][keep:]
         self.owned[key] = self.owned[key][:keep]
         self.tokens[key] = tokens
-        self.free.extend(released)
+        freed = self.release_pages(released)
         if key in self.retained:
             self.retain(key)
-        return len(released)
+        return freed
 
     def grow(self, key, capacity_tokens: int) -> int | None:
         """Add pages for capacity_tokens without changing logical tokens."""
         if key not in self.owned:
             raise KeyError(key)
-        need = self.pages_needed(capacity_tokens) - len(self.owned[key])
+        need = (self.pages_needed(capacity_tokens) - len(self.borrowed[key])
+                - len(self.owned[key]))
         if need <= 0:
             return 0
         if need > len(self.free):
             return None
-        self.owned[key].extend(self.free.pop() for _ in range(need))
+        added = [self.free.pop() for _ in range(need)]
+        self.owned[key].extend(added)
+        for page in added:
+            self.holds[page] += 1
         return need
 
     def row_indices(self, key, tokens=None):
@@ -171,7 +252,7 @@ class PageArena:
         """
         rows = []
         left = self.tokens[key] if tokens is None else tokens
-        for p in self.owned[key]:
+        for p in self.table_pages(key):
             take = min(left, self.page_tokens)
             base = p * self.page_tokens
             rows.extend(range(base, base + take))
@@ -277,6 +358,10 @@ class KVArena:
         self._sliding_rows = {}   # key -> every row in its sliding pages
         self._base = {}       # key -> tokens the window is anchored below
         self._sliding_start = {}  # key -> logical row of its first sliding page
+        self._holds = {}      # key -> queued keys that will borrow from it
+        self._deferred = set()    # held keys freed by their operator
+        self._window_floor = {}   # key -> lowest sliding row a borrower reads
+        self._trimmed = set()     # keys past their own pass's trim_window
 
     def resize(self, n_pages: int, n_sliding_pages: int = 0, *,
                free_resident: bool = False) -> None:
@@ -286,6 +371,7 @@ class KVArena:
         key first, and without it a resident key is an error.
         """
         if free_resident:
+            self.drop_holds()
             for key in self.resident_keys():
                 self.free_key(key)
         if self.accounting.owned:
@@ -317,56 +403,121 @@ class KVArena:
         """The logical row of the key's first sliding page."""
         return self._sliding_start[key]
 
+    def keep_window(self, key, shared: int) -> None:
+        """Keep the key's sliding rows a borrower of `shared` tokens reads.
+
+        trim_window never drops rows from the window origin below
+        `shared` on.
+        """
+        row = self.origin(shared)
+        self._window_floor[key] = min(self._window_floor.get(key, row), row)
+
     def trim_window(self, key) -> int:
         """Release a key's sliding pages before its window origin.
 
-        Returns the pages freed, in every-token pages.
+        Rows a borrower still reads (see keep_window) stay. Returns the
+        pages freed, in every-token pages.
         """
         if self.sliding is None:
             return 0
-        origin = self.origin(self._base[key])
+        self._trimmed.add(key)
+        origin = min(self.origin(self._base[key]),
+                     self._window_floor.get(key, self._base[key]))
         start = self._sliding_start[key]
         if origin <= start:
             return 0
         before = self.free_pages
         drop = (origin - start) // self.page_tokens
-        owned = self.sliding.owned[key]
-        self.sliding.free.extend(owned[:drop])
-        self.sliding.owned[key] = owned[drop:]
+        self.sliding.drop_leading(key, drop)
         self.sliding.tokens[key] -= origin - start
         self._sliding_start[key] = origin
         self._refresh_rows(key)
         return self.free_pages - before
 
+    def _lift_floor(self, key) -> None:
+        """The last borrower is admitted: rows kept for it may go.
+
+        A key that already trimmed for its own pass trims again; one
+        still to run trims after that pass.
+        """
+        if self._window_floor.pop(key, None) is not None and key in self._trimmed:
+            self.trim_window(key)
+
     # ---- allocation ----------------------------------------------------
 
     def alloc(self, key, tokens: int, capacity_tokens: int | None = None,
-              base_tokens: int | None = None, sliding_tokens=None):
+              base_tokens: int | None = None, sliding_tokens=None,
+              borrow=None):
         """Pages for a fresh key in both pools, or None when either is short.
 
         sliding_tokens sizes the sliding pages when they differ from
-        capacity_tokens, as a temporary's do.
+        capacity_tokens, as a temporary's do. borrow is (parent key,
+        shared tokens): the key reads the parent's pages for its first
+        `shared tokens`, a whole number of pages. On the sliding pool
+        it reads the parent's pages from the window origin below the
+        shared prefix, so the parent must still hold them (see
+        trim_window).
         """
         capacity = tokens if capacity_tokens is None else capacity_tokens
-        pages = self.accounting.alloc(key, tokens, capacity)
+        borrowed, borrowed_s, start_s = self._borrow_plan(borrow)
+        pages = self.accounting.alloc(key, tokens, capacity, borrowed=borrowed)
         if pages is None:
             return None
         if self.sliding is not None:
             want = capacity if sliding_tokens is None else sliding_tokens
-            got = self.sliding.alloc(key, min(tokens, want), want)
+            got = self.sliding.alloc(key, min(tokens, want) - start_s,
+                                     want - start_s, borrowed=borrowed_s)
             if got is None:
                 self.accounting.free_key(key)
                 return None
         self._base[key] = tokens if base_tokens is None else base_tokens
-        self._sliding_start[key] = 0
+        self._sliding_start[key] = start_s
         # the logical rows are the first `tokens` entries of the
         # capacity rows (same pages, same order), so build once and
         # slice instead of walking the pages twice
         self._refresh_rows(key, tokens)
         return pages
 
+    def can_borrow(self, parent, shared: int) -> bool:
+        """Whether a fresh key may borrow the parent's first `shared` tokens.
+
+        The sliding pool must still hold the parent's rows from the
+        window origin below the shared prefix: a parent that borrowed
+        most of its own prefix never had them, and a trimmed one
+        dropped them.
+        """
+        if (parent not in self.accounting.owned
+                or shared > self.accounting.tokens[parent]):
+            return False
+        if self.sliding is None:
+            return True
+        return self._sliding_start[parent] <= self.origin(shared)
+
+    def _borrow_plan(self, borrow):
+        """The pages a borrow takes from each pool, and the sliding start.
+
+        Returns (full pool pages, sliding pool pages, sliding start).
+        The sliding start is the window origin below the shared
+        tokens: the rows a sliding layer reads before the key's own.
+        """
+        if borrow is None:
+            return [], [], 0
+        parent, shared = borrow
+        borrowed = self.accounting.shared_pages(parent, shared)
+        if self.sliding is None:
+            return borrowed, [], 0
+        start = self.origin(shared)
+        parent_start = self._sliding_start[parent]
+        if parent_start > start:
+            raise ValueError(
+                f"{parent!r} trimmed its window past row {start}; "
+                f"a child sharing {shared} tokens needs it")
+        borrowed_s = self.sliding.shared_pages(
+            parent, shared - parent_start, start - parent_start)
+        return borrowed, borrowed_s, start
+
     def _page_rows(self, arena, key, tokens):
-        pages = np.asarray(arena.owned[key], dtype=np.int64)
+        pages = np.asarray(arena.table_pages(key), dtype=np.int64)
         rows = (pages[:, None] * self.page_tokens
                 + np.arange(self.page_tokens, dtype=np.int64))
         return self.torch.from_numpy(rows.reshape(-1)[:tokens])
@@ -374,14 +525,14 @@ class KVArena:
     def _refresh_rows(self, key, logical_tokens=None):
         logical = (self.accounting.tokens[key]
                    if logical_tokens is None else logical_tokens)
-        capacity = len(self.accounting.owned[key]) * self.page_tokens
+        capacity = len(self.accounting.table_pages(key)) * self.page_tokens
         cap = self._capacity_rows.get(key)
         if cap is None or cap.numel() != capacity:
             cap = self._page_rows(self.accounting, key, capacity)
         self._capacity_rows[key] = cap
         self._rows[key] = cap[:logical]
         if self.sliding is not None:
-            capacity_s = len(self.sliding.owned[key]) * self.page_tokens
+            capacity_s = len(self.sliding.table_pages(key)) * self.page_tokens
             self._sliding_rows[key] = self._page_rows(self.sliding, key, capacity_s)
 
     def pin(self, key):
@@ -423,10 +574,13 @@ class KVArena:
             lambda: self.free_pages - start >= pages_needed)
 
     def _evict_until(self, satisfied) -> tuple:
-        """Evict retained prefixes in priority order until satisfied() holds."""
+        """Evict retained prefixes in priority order until satisfied() holds.
+
+        A held key is never evicted: a queued borrower will read it.
+        """
         keys = []
         while not satisfied():
-            victim = self.accounting.pop_retained_victim()
+            victim = self.accounting.pop_retained_victim(keep=self._holds)
             if victim is None:
                 break
             keys.append(victim[0])
@@ -448,9 +602,8 @@ class KVArena:
         length in tokens. Keys that are not an alias and a document
         index are not reported.
         """
-        pages = len(self.accounting.owned[key])
         prefix_tokens = self.accounting.tokens[key]
-        self.free_key(key)
+        pages = self.free_key(key)
         self.evicted_keys += 1
         self.evicted_pages += pages
         self.evicted_prefix_tokens += prefix_tokens
@@ -462,20 +615,21 @@ class KVArena:
         return pages
 
     def activate(self, key, tokens: int, capacity_tokens: int | None = None,
-                 base_tokens: int | None = None):
+                 base_tokens: int | None = None, borrow=None):
         """Make a prefix active, evicting retained KV when required.
 
         base_tokens anchors a fresh key's sliding window; a resident
-        key keeps the base it was given.
+        key keeps the base it was given. borrow is (parent key, shared
+        tokens) for a fresh key, as alloc takes it.
         """
         capacity = tokens if capacity_tokens is None else capacity_tokens
         if key in self.accounting.owned:
             self.accounting.pin(key)
             need = max(0, self.accounting.pages_needed(capacity)
-                       - len(self.accounting.owned[key]))
+                       - len(self.accounting.table_pages(key)))
             capacity_s = capacity - self._sliding_start[key]
             need_s = (max(0, self.sliding.pages_needed(capacity_s)
-                          - len(self.sliding.owned[key]))
+                          - len(self.sliding.table_pages(key)))
                       if self.sliding is not None else 0)
             self._evict_for_pages(need, need_s)
             # neither pool grows unless both can, so a refusal leaves
@@ -493,9 +647,12 @@ class KVArena:
             self._refresh_rows(key, tokens)
             return self.accounting.owned[key]
 
-        need = self.accounting.pages_needed(capacity)
-        self._evict_for_pages(need, need)
-        pages = self.alloc(key, tokens, capacity, base_tokens)
+        borrowed, borrowed_s, start_s = self._borrow_plan(borrow)
+        need = self.accounting.pages_needed(capacity) - len(borrowed)
+        need_s = (self.sliding.pages_needed(capacity - start_s) - len(borrowed_s)
+                  if self.sliding is not None else need)
+        self._evict_for_pages(need, need_s)
+        pages = self.alloc(key, tokens, capacity, base_tokens, borrow=borrow)
         if pages is not None:
             self.accounting.pin(key)
         return pages
@@ -506,7 +663,58 @@ class KVArena:
                            sliding_tokens=sliding_tokens)
         return None if pages is None else (key, pages)
 
+    # ---- holds: keys that queued borrowers will read ------------------
+
+    def hold(self, key, borrowers: int) -> None:
+        """Keep a key for `borrowers` keys that will borrow its pages.
+
+        A held key is never evicted, and free_key on it waits until the
+        last borrower has released it.
+        """
+        if borrowers:
+            self._holds[key] = self._holds.get(key, 0) + borrowers
+
+    def release(self, key) -> None:
+        """One borrower of the key was admitted, or will not come."""
+        if key not in self._holds:
+            return
+        self._holds[key] -= 1
+        if not self._holds[key]:
+            del self._holds[key]
+            if key in self._deferred:
+                self._deferred.discard(key)
+                self.free_key(key)
+            else:
+                self._lift_floor(key)
+
+    def drop_holds(self, keys=None) -> bool:
+        """Release every hold on the keys (all keys by default).
+
+        Held keys already freed go free now, and retained ones become
+        evictable; their queued borrowers compute their whole prefix
+        instead. Returns whether any hold was released.
+        """
+        keys = list(self._holds) if keys is None else [
+            key for key in keys if key in self._holds]
+        for key in keys:
+            del self._holds[key]
+            if key in self._deferred:
+                self._deferred.discard(key)
+                self.free_key(key)
+            else:
+                self._lift_floor(key)
+        return bool(keys)
+
     def free_key(self, key):
+        """Free a key's pages, or once its holds are released.
+
+        Returns the pages that went free now.
+        """
+        if key in self._holds:
+            self._deferred.add(key)
+            return 0
+        self._window_floor.pop(key, None)
+        self._trimmed.discard(key)
         self._rows.pop(key)
         self._capacity_rows.pop(key)
         self._sliding_rows.pop(key, None)
@@ -561,6 +769,22 @@ class KVArena:
         return max(pages, self._as_every_token_pages(
             len(self.sliding.owned[key])))
 
+    def growth_cost(self, key, capacity_tokens: int) -> int:
+        """Pages a resident key needs to grow to capacity, in every-token pages.
+
+        The same counts activate takes for a resident key: each pool's
+        pages beyond the ones the key's table already has, the sliding
+        pool's from the key's window start.
+        """
+        need = max(0, self.accounting.pages_needed(capacity_tokens)
+                   - len(self.accounting.table_pages(key)))
+        if self.sliding is None:
+            return need
+        need_s = max(0, self.sliding.pages_needed(
+            capacity_tokens - self._sliding_start[key])
+            - len(self.sliding.table_pages(key)))
+        return max(need, self._as_every_token_pages(need_s))
+
     def _as_every_token_pages(self, sliding_pages: int) -> int:
         """Sliding pages converted at the pools' size ratio, rounded up."""
         return -(-sliding_pages * self.accounting.n_pages
@@ -601,12 +825,18 @@ class KVArena:
         return list(self.accounting.retained)
 
     def owned_pages(self, key) -> list:
-        """The page ids a resident key holds, in logical order."""
-        return self.accounting.owned[key]
+        """The page ids a resident key's block table reads, in logical order.
+
+        Borrowed pages come first, then the key's own.
+        """
+        return self.accounting.table_pages(key)
 
     def owned_sliding_pages(self, key) -> list:
-        """The sliding-pool page ids a resident key holds, in logical order."""
-        return self.sliding.owned[key]
+        """The sliding-pool page ids a key's block table reads, in logical order.
+
+        Borrowed pages come first, then the key's own.
+        """
+        return self.sliding.table_pages(key)
 
     def capacity_rows(self, key):
         """Row index tensor (CPU) over every row in the key's pages."""
@@ -633,7 +863,7 @@ class KVArena:
 
         Built flat on the host and staged through pinned memory.
         """
-        pages = [self.accounting.owned[k] for k in keys]
+        pages = [self.accounting.table_pages(k) for k in keys]
         table = self.block_table_rows(pages, pad_to=pad_to)
         torch = self.torch
         used = torch.tensor([self.accounting.tokens[k] for k in keys],

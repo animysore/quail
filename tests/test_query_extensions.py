@@ -46,7 +46,8 @@ def test_query_scans_provider_and_preserves_extension_objects(
 
     def execute(physical, registry):
         assert registry is session.registry
-        assert calls == ["initialize", "plan"]
+        # planned once on estimated lengths, once more on the token store
+        assert calls == ["initialize", "plan", "plan"]
         calls.append("execute")
         assert "extensions" not in physical.plan
         assert physical.plan["device"] == session.config.device
@@ -83,7 +84,7 @@ def test_query_scans_provider_and_preserves_extension_objects(
 
     assert response.collect().to_pydict() == {"d.id": ["a"]}
     assert response.report["fresh_tokens"] == 4
-    assert calls == ["initialize", "plan", "execute"]
+    assert calls == ["initialize", "plan", "plan", "execute"]
     assert received.collect().equals(response.collect())
     assert received.plan == response.plan
     assert received.node_metrics == response.node_metrics

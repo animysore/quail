@@ -578,6 +578,12 @@ class AiFilter(PhysicalNode):
     hold_tokens: int = 0
     stages: tuple[FilterStage, ...] = ()
     question_token_ids: tuple[tuple[Any, ...], ...] = ()
+    # documents borrow the KV pages of a document that shares their
+    # token prefix (the prefix_sharing rule)
+    share_prefixes: bool = False
+    # "unified" or "tree": the attention path the tree_attention rule
+    # chose; empty leaves the executor's default
+    attention: str = ""
 
     type_name: ClassVar[str] = "quail.ai_filter"
     runtime_key: ClassVar[str] = type_name
@@ -610,6 +616,8 @@ class AiFilter(PhysicalNode):
             "question_token_ids": [
                 list(question) for question in self.question_token_ids
             ],
+            "share_prefixes": self.share_prefixes,
+            "attention": self.attention,
         }
 
     def explain_fields(self) -> Mapping[str, Any]:
@@ -635,6 +643,8 @@ class AiFilter(PhysicalNode):
                 tuple(question)
                 for question in attributes["question_token_ids"]
             ),
+            share_prefixes=bool(attributes.get("share_prefixes", False)),
+            attention=str(attributes.get("attention", "")),
         )
 
 
@@ -681,6 +691,12 @@ class AiJoin(PhysicalNode):
     anchor_resident: str = "none"
     keep_anchor_kv: bool = False
     stages: tuple[JoinStage, ...] = ()
+    # "unified" or "tree": the attention path the tree_attention rule
+    # chose; empty leaves the model pipeline's default
+    attention: str = ""
+    # anchors borrow the KV pages of an anchor that shares their token
+    # prefix (the prefix_sharing rule)
+    share_prefixes: bool = False
 
     type_name: ClassVar[str] = "quail.ai_join"
     runtime_key: ClassVar[str] = type_name
@@ -707,6 +723,8 @@ class AiJoin(PhysicalNode):
             "anchor_resident": self.anchor_resident,
             "keep_anchor_kv": self.keep_anchor_kv,
             "stages": [stage.to_dict() for stage in self.stages],
+            "attention": self.attention,
+            "share_prefixes": self.share_prefixes,
         }
 
     def explain_fields(self) -> dict:
@@ -725,6 +743,8 @@ class AiJoin(PhysicalNode):
                 JoinStage.from_mapping(stage)
                 for stage in attributes["stages"]
             ),
+            attention=str(attributes.get("attention", "")),
+            share_prefixes=bool(attributes.get("share_prefixes", False)),
         )
 
 

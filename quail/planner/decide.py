@@ -851,22 +851,49 @@ def plan_query(plan: LogicalPlan, *, model: ModelSpec,
         raise ValueError(
             f"physical planner returned backend {selected_plan.backend!r} "
             f"for selected backend {backend!r}")
-    graph, changed = apply_physical_rules(
-        selected_plan.graph,
-        tuple(registry.physical_rules.values()),
-        context,
+    return _apply_rules(selected_plan, registry, context, "")
+
+
+def refine_plan(plan, *, model: ModelSpec, device: DeviceSpec,
+                doc_tokens: dict, gpus: int = 1, backend: str = "quail",
+                registry=None, order: str | None = None,
+                tokenizer=None, pair_fractions=None):
+    """Run the physical rules again over a plan once its inputs are exact.
+
+    A plan made on estimated document lengths never saw the token
+    stores, which some rules read (prefix_sharing measures the shared
+    prefixes of a corpus). Takes the same inputs as plan_query and
+    returns the plan with any rule's rewrite applied.
+    """
+    if isinstance(plan, Refusal):
+        return plan
+    if registry is None:
+        from quail.builtins import built_in_registry
+        registry = built_in_registry()
+    context = PlanningContext(
+        model=model,
+        device=device,
+        gpu_count=gpus,
+        document_tokens=doc_tokens,
+        backend=backend,
+        order=order,
+        tokenizer=tokenizer,
+        pair_fractions=dict(pair_fractions or {}),
     )
-    if changed:
-        selected_plan = replace(
-            selected_plan,
-            nodes=graph.nodes,
-            root=graph.root,
-            remarks=selected_plan.remarks + tuple(
-                f"physical rule {name} changed the plan"
-                for name in changed
-            ),
-        )
-    return selected_plan
+    return _apply_rules(plan, registry, context,
+                        " once the documents were tokenized")
+
+
+def _apply_rules(plan, registry, context, when: str):
+    """Apply the registered physical rules; a remark names each that fired."""
+    graph, changed = apply_physical_rules(
+        plan.graph, tuple(registry.physical_rules.values()), context)
+    if not changed:
+        return plan
+    return replace(
+        plan, nodes=graph.nodes, root=graph.root,
+        remarks=plan.remarks + tuple(
+            f"physical rule {name} changed the plan{when}" for name in changed))
 
 
 def _filter_alias(pred_or_list):

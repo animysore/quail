@@ -122,7 +122,7 @@ def test_submit_close_reattach_watch_collect_and_stream_answers(endpoint, tmp_pa
         assert sum(table["answer"].to_pylist()) == len(result.to_rows())
 
 
-def test_unsupported_providers_and_bad_queries_fail_clearly(endpoint, tmp_path):
+def test_bad_queries_cancel_and_timeout_fail_clearly(endpoint, tmp_path):
     with quail.Session(CONFIG, tokenizer=server_fakes.fake_tok) as session:
         assert session.endpoint is None
         register_reviews(session, tmp_path)
@@ -155,8 +155,6 @@ def test_unsupported_providers_and_bad_queries_fail_clearly(endpoint, tmp_path):
         with quail.Session(CONFIG, endpoint="http://127.0.0.1:9") as session:
             session.get_run("x").status()
 
-
-def test_cancel_and_timeout_raise_from_result(endpoint, tmp_path):
     with quail.Session(CONFIG, endpoint=endpoint(
             hooks=server_fakes.sleeping_hooks)) as session:
         register_reviews(session, tmp_path)

@@ -33,7 +33,16 @@ def _pair_call(kind="boolean"):
     return ModelCall(bind_join_prompt("same {0} {1}", (R, P)), kind)
 
 
-def test_model_call_reports_its_aliases_and_kind():
+INVALID_PREDICATES = [
+    (Compare(_filter_call(), ">=", 0.5), "only an AI.SCORE call compares"),
+    (Compare(_filter_call("score"), "=", 0.5), "unsupported AI.SCORE comparison"),
+    (Compare(_filter_call("score"), ">=", 1.5), "between 0 and 1"),
+    (_filter_call("score"), "only when compared"),
+    (ModelCall(bind_prompt("q {0}", (R,)), "label"), "kind must be one of"),
+]
+
+
+def test_model_calls_and_predicates_validate_kind_comparison_and_input():
     call = _pair_call("score")
     assert call.aliases() == ("r", "p")
     assert is_score(call)
@@ -42,23 +51,17 @@ def test_model_call_reports_its_aliases_and_kind():
     assert model_call(compare) is call
     assert model_call(Alias(call, "s")) is call
 
+    for expression, message in INVALID_PREDICATES:
+        node = SemanticFilter(
+            Scan("reviews", "r", "review"), (FilterPredicate(expression),)
+        )
+        try:
+            node.validate()
+        except CompileError as error:
+            assert message in str(error), expression
+        else:
+            raise AssertionError(f"validated: {expression}")
 
-@pytest.mark.parametrize("expression,message", [
-    (Compare(_filter_call(), ">=", 0.5), "only an AI.SCORE call compares"),
-    (Compare(_filter_call("score"), "=", 0.5), "unsupported AI.SCORE comparison"),
-    (Compare(_filter_call("score"), ">=", 1.5), "between 0 and 1"),
-    (_filter_call("score"), "only when compared"),
-    (ModelCall(bind_prompt("q {0}", (R,)), "label"), "kind must be one of"),
-])
-def test_predicates_must_answer_yes_or_no(expression, message):
-    node = SemanticFilter(
-        Scan("reviews", "r", "review"), (FilterPredicate(expression),)
-    )
-    with pytest.raises(CompileError, match=message):
-        node.validate()
-
-
-def test_semantic_join_checks_its_predicate_against_its_input():
     r = Scan("reviews", "r", "review")
     p = Scan("products", "p", "description")
     SemanticJoin(Join(r, p), _pair_call()).validate()

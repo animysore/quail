@@ -70,7 +70,9 @@ is the selectivity it planned with. A selectivity you did not set
 shows as `20%*`, with a footnote.
 
 `explain(verbose=True)` adds node ids, port connections, KV retention
-decisions, and planner remarks.
+decisions, and planner remarks. It also shows `share_prefixes`
+(whether prefix caching is enabled) and `attention` (`unified` or
+`tree`) for each operator.
 
 ## Measure the plan
 

@@ -17,7 +17,7 @@ report = result.report
 | `wall_s` | Query execution time in seconds, not counting model startup. |
 | `boot_s` | How long it took to load the model and compile kernels. |
 | `boot_kind` | `"cold"` if this was the first query in the session (model loaded from disk), `"warm"` if the model was already in memory. |
-| `fresh_tokens` | Total input tokens processed by the model. If a token's KV was evicted and the model had to reprocess it, it counts again. |
+| `fresh_tokens` | Input token positions computed by the model. Recomputing a position counts again. Reading saved KV does not count. |
 | `worker_total_s` | Wall time including tokenization and planning, but not report writes. |
 | `remarks` | Notes from the planner and tokenizer, for example which tokenizer was selected and why. |
 
@@ -46,6 +46,7 @@ the nodes shown in `explain()` output.
 | `output_rows` | How many passed. |
 | `fresh_tokens` | Input tokens this node processed. |
 | `evaluated_documents` | Documents evaluated (filters only). |
+| `borrowed_prefix_tokens` | Token positions reused from another document's prefix KV. Reported by filters and joins when the count is nonzero. |
 
 ## Boot details
 

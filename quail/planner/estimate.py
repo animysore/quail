@@ -33,7 +33,7 @@ from quail.planner.decide import (
 )
 from quail.planner.leftdeep import Extension, optimize_left_deep
 from quail.planner.live_rows import PairRelation, exact_live_rows
-from quail.planner.prefixes import prefix_credits
+from quail.planner.prefixes import document_shared_tokens
 from quail.specs import DeviceSpec, ModelSpec
 
 # answer(prompt, assignment) -> bool, where assignment maps each alias
@@ -163,7 +163,7 @@ class SpeedOfLightEstimate:
 class _AliasData:
     column: str
     tokens: list[int]
-    credits: list[int]
+    shared: list[int]
 
 
 def _prompt_token_counts(prompt):
@@ -174,7 +174,11 @@ def _prompt_token_counts(prompt):
 
 
 class _Search:
-    """One estimate's state: corpus tokens, the oracle, and the credit."""
+    """One estimate's state: corpus tokens, the oracle, and the credit.
+
+    The credit is the shared prefix counted as read from KV rather
+    than computed, when credit_shared is on.
+    """
 
     def __init__(self, query, answer: AnswerOracle, model: ModelSpec,
                  device: DeviceSpec, chunk_tokens: int,
@@ -199,12 +203,12 @@ class _Search:
         for scan_node in self.scans:
             store = stores[scan_node.alias]
             tokens = [int(length) for length in store.lengths]
-            credits = (prefix_credits(store) if credit_shared
+            shared = (document_shared_tokens(store) if credit_shared
                        else [0] * len(tokens))
             self.aliases[scan_node.alias] = _AliasData(
                 column=f"{scan_node.provider}.{scan_node.column}",
                 tokens=tokens,
-                credits=credits,
+                shared=shared,
             )
         # column -> rows every filtered alias of that column computed
         # as prefixes; another alias of the column may reuse them
@@ -244,7 +248,7 @@ class _Search:
         """
         data = self.aliases[alias]
         prefix = self.pre + data.tokens[row]
-        shared_tokens = data.credits[row]
+        shared_tokens = data.shared[row]
         if shared_tokens == 0:
             return scan(prefix, suffix, window=self.window)
         resident = self.pre + shared_tokens

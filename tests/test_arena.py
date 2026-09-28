@@ -7,7 +7,7 @@ import pytest
 from quail.backends.quail.executor.arena import PageArena
 
 
-def test_allocation_preserves_page_ownership():
+def test_allocation_retention_rewind_and_pinning():
     a = PageArena(n_pages=10, page_tokens=16)
     pages = a.alloc("d0", 40)      # 3 pages
     assert len(pages) == 3
@@ -46,8 +46,6 @@ def test_allocation_preserves_page_ownership():
     assert a.grow("doc", 12) == 2
     assert a.grow("doc", 16) is None
 
-
-def test_retention_rewind_and_pinning():
     a = PageArena(n_pages=10, page_tokens=4)
     a.alloc("doc", 7, capacity_tokens=11)
     assert len(a.owned["doc"]) == 3
@@ -80,3 +78,62 @@ def test_retention_rewind_and_pinning():
     a.pin("doc")
 
     assert a.pop_retained_victim() is None
+
+
+def test_borrowed_pages_are_shared_until_the_last_holder_frees_them():
+    a = PageArena(n_pages=10, page_tokens=16)
+    parent = a.alloc("p", 40)                 # pages for 40 tokens: 3
+    child = a.alloc("c", 50, borrowed=a.shared_pages("p", 32))  # borrows 2, owns 2
+    assert len(child) == 2 and a.free_pages == 5
+    assert a.table_pages("c") == parent[:2] + child
+    assert a.borrowed_tokens("c") == 32
+    assert a.row_indices("c")[:32] == a.row_indices("p")[:32]
+    # the parent's shared pages outlive the parent
+    assert a.free_key("p") == 1
+    assert a.free_pages == 6
+    assert a.table_pages("c") == parent[:2] + child
+    assert a.free_key("c") == 4
+    assert a.free_pages == 10
+
+    # a grandchild borrows through its parent's borrowed pages
+    a.alloc("p", 40)
+    a.alloc("c", 50, borrowed=a.shared_pages("p", 32))
+    a.alloc("g", 60, borrowed=a.shared_pages("c", 48))
+    assert a.table_pages("g")[:2] == a.table_pages("p")[:2]
+    assert a.table_pages("g")[2] == a.owned["c"][0]
+    for key in ("p", "c", "g"):
+        a.free_key(key)
+    assert a.free_pages == 10
+
+    # rewinding never drops borrowed pages; growing adds own pages
+    a.alloc("p", 40)
+    a.alloc("c", 50, borrowed=a.shared_pages("p", 32))
+    assert a.rewind("c", 33) == 1
+    assert a.tokens["c"] == 33 and len(a.owned["c"]) == 1
+    with pytest.raises(ValueError):
+        a.rewind("c", 16)
+    assert a.grow("c", 64) == 1
+    assert len(a.table_pages("c")) == 4
+    assert a.retained_pages == 0
+    a.retain("c")
+    assert a.retained_pages == 2       # the pages it alone holds
+    a.free_key("p")
+    a.retain("c")
+    assert a.retained_pages == 4       # now the borrowed pages too
+    a.alloc("p", 40)
+
+    with pytest.raises(ValueError):
+        a.shared_pages("p", 20)                 # not a whole page
+    with pytest.raises(ValueError):
+        a.alloc("x", 16, borrowed=a.shared_pages("p", 32))  # past its tokens
+    with pytest.raises(KeyError):
+        a.shared_pages("nobody", 16)
+    with pytest.raises(ValueError):
+        a.shared_pages("p", 48)                 # parent holds 40
+    # a slice of the parent, as the sliding pool borrows, and dropping
+    # leading pages takes borrowed pages before own ones
+    a.alloc("s", 48, borrowed=a.shared_pages("p", 32, 16))
+    assert a.table_pages("s")[:1] == a.table_pages("p")[1:2]
+    # the parent still holds the borrowed page; one own page goes free
+    assert a.drop_leading("s", 2) == 1
+    assert a.borrowed["s"] == [] and len(a.owned["s"]) == 1

@@ -3,8 +3,6 @@
 from dataclasses import dataclass, replace
 from typing import ClassVar
 
-import pytest
-
 from quail.logical import ColumnRef, LogicalPlan, Project, Scan
 from quail.planner.logical_optimizer import (
     LogicalPlanningContext,
@@ -73,25 +71,28 @@ def _tagged_plan(tag):
     return LogicalPlan(Project(TaggedInput(scan, tag), (field,)))
 
 
-@pytest.mark.parametrize("start,rules,tag,changed", [
+REWRITES = [
     ("old", [("old", "new")], "new", ("rename_old_new",)),
     # the second rule only matches after the first has run, and it is
     # listed first, so a single round would miss it
     ("old", [("mid", "new"), ("old", "mid")], "new",
      ("rename_old_mid", "rename_mid_new")),
     ("new", [("old", "new")], "new", ()),
-])
-def test_custom_logical_node_rewrites_until_a_round_changes_nothing(
-        start, rules, tag, changed):
-    plan = _tagged_plan(start)
-    optimized, applied = apply_logical_rules(
-        plan, tuple(RenameTag(old, new) for old, new in rules), CONTEXT)
+]
 
-    assert [node.type_name for node in optimized.walk()] == [
-        "quail.scan", "test.tagged_input", "quail.logical_project"]
-    assert optimized.root.input.tag == tag
-    assert applied == changed
-    assert (optimized.root is plan.root) == (not changed)
+
+def test_custom_logical_node_rewrites_until_a_round_changes_nothing():
+    for start, rules, tag, changed in REWRITES:
+        case = f"{start} {rules}"
+        plan = _tagged_plan(start)
+        optimized, applied = apply_logical_rules(
+            plan, tuple(RenameTag(old, new) for old, new in rules), CONTEXT)
+
+        assert [node.type_name for node in optimized.walk()] == [
+            "quail.scan", "test.tagged_input", "quail.logical_project"], case
+        assert optimized.root.input.tag == tag, case
+        assert applied == changed, case
+        assert (optimized.root is plan.root) == (not changed), case
 
 
 def test_rules_that_never_settle_stop_at_the_pass_cap():
