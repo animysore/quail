@@ -350,12 +350,23 @@ class QuailBackend:
     ) -> tuple[PhysicalCandidate, ...]:
 
         operators = region.logical_plan.operators()
+        if any(
+            isinstance(expression, Alias) and expression.expression.kind == "extract"
+            for expression in region.logical_plan.root.columns
+        ):
+            refusal = Refusal(
+                reasons=("AI.EXTRACT requires dumb_vllm, stock_vllm, "
+                         "or pipelined_vllm",),
+                constraint="extract_needs_vllm", needed=1, available=0,
+                unit="extraction backends",
+            )
+            return (PhysicalCandidate(None, refusal, float("inf")),)
         has_score = any(
             is_score(predicate.expression)
             for predicates in operators.filters.values()
             for predicate in predicates
         ) or any(is_score(join.predicate) for join in operators.joins) or any(
-            isinstance(expression, Alias)
+            isinstance(expression, Alias) and is_score(expression)
             for expression in region.logical_plan.root.columns
         )
         if context.model.role == "reranker":

@@ -17,6 +17,7 @@ from quail.logical import (
     LogicalPlan,
     LogicalPlanBuilder,
     ModelCall,
+    bind_extract_prompt,
     bind_join_prompt,
     bind_prompt,
     bind_score_prompt,
@@ -69,8 +70,8 @@ def _normalize_ai_calls(sql: str, dialect: SQLDialect) -> str:
         head, dot, name, left = tokens[index:index + 4]
         function = name.text.upper()
         replacement = None
-        if function == "SCORE":
-            replacement = "AI_SCORE("
+        if function in {"SCORE", "EXTRACT"}:
+            replacement = f"AI_{function}("
         elif function == "IF" and dialect is SQLDialect.BQ:
             replacement = "AI_FILTER("
         if head.text.upper() == "AI" and dot.text == "." \
@@ -127,11 +128,11 @@ def _reject_forbidden(tree) -> None:
     for fn in tree.find_all(exp.Anonymous):
         name = str(fn.this).upper()
         if name.startswith("AI_") and name not in {
-            "AI_FILTER", "AI_SCORE",
+            "AI_FILTER", "AI_SCORE", "AI_EXTRACT",
         }:
             raise CompileError(
                 f"{name} is not supported; supported AI functions are "
-                "AI_FILTER and AI_SCORE"
+                "AI_FILTER, AI_SCORE, and AI_EXTRACT"
             )
     # subqueries are legal only as the EXISTS form, checked
     # structurally; any other subquery is refused here
@@ -285,6 +286,30 @@ class _Binder:
             node, "AI_FILTER", allowed, scope=scope, join=join
         )
         return ModelCall(prompt, "boolean"), options, aliases
+
+    def parse_ai_extract(self, node):
+        args = node.expressions
+        if len(args) < 2 or not isinstance(args[0], exp.Column):
+            raise CompileError(
+                "AI.EXTRACT takes a document column and string field names"
+            )
+        if any(not isinstance(arg, exp.Literal) or not arg.is_string
+               for arg in args[1:]):
+            raise CompileError("AI.EXTRACT field names must be string literals")
+        document = self.resolve_column(args[0])
+        import pyarrow as pa
+
+        dtype = self.catalog.get(document.provider).schema().field(
+            document.column
+        ).type
+        if not (pa.types.is_string(dtype) or pa.types.is_large_string(dtype)):
+            raise CompileError("AI.EXTRACT needs a text document column")
+        fields = tuple(str(arg.this) for arg in args[1:])
+        prompt = bind_extract_prompt(document, fields, self.tokenizer, self.turn)
+        call = ModelCall(prompt, "extract", fields)
+        call.validate()
+        self.note_doc_column(document)
+        return call
 
     def parse_ai_score(self, node, allowed: set, scope=None, join=None):
         """Parse a compared AI.SCORE call into a Compare, options, and aliases.
@@ -516,21 +541,31 @@ def compile_sql(sql: str, catalog: Catalog,
         add_join_spec(predicate, options, aliases)
 
     columns = _compile_projection(b, tree.expressions)
-    projected_scores = tuple(
+    projected_calls = tuple(
         column for column in columns if isinstance(column, Alias)
     )
+    projected_scores = tuple(
+        column for column in projected_calls if is_score(column)
+    )
+    extracts = tuple(
+        column for column in projected_calls
+        if column.expression.kind == "extract"
+    )
+    if extracts and len(b.tables) != 1:
+        raise CompileError("AI.EXTRACT currently supports one table without joins")
     names_by_prompt = {}
-    for score in projected_scores:
-        if score.name in dict(b.tables):
+    for column in projected_calls:
+        function = "AI.SCORE" if is_score(column) else "AI.EXTRACT"
+        if column.name in dict(b.tables):
             raise CompileError(
-                f"AI.SCORE output name {score.name!r} is also a table "
+                f"{function} output name {column.name!r} is also a table "
                 f"alias; pick another AS name")
-        names = names_by_prompt.setdefault(score.expression.prompt, [])
+        names = names_by_prompt.setdefault(column.expression, [])
         if names:
             raise CompileError(
-                f"the same AI.SCORE expression is projected as "
-                f"{names[0]!r} and {score.name!r}; project it once")
-        names.append(score.name)
+                f"the same {function} expression is projected as "
+                f"{names[0]!r} and {column.name!r}; project it once")
+        names.append(column.name)
 
     for alias, equalities in conditions.items():
         if any(alias in score.expression.aliases()
@@ -554,14 +589,14 @@ def compile_sql(sql: str, catalog: Catalog,
     score_flags = [
         is_score(predicate.expression) for predicate in filter_predicates
     ] + [is_score(join.predicate) for join in b.joins] \
-        + [True for _ in projected_scores]
+        + [is_score(column) for column in projected_calls]
     if any(score_flags) and not all(score_flags):
         raise CompileError(
             "AI.SCORE cannot be mixed with generative AI predicates "
             "in one query"
         )
 
-    if not b.joins and not b.filters and not projected_scores:
+    if not b.joins and not b.filters and not projected_calls:
         raise CompileError("the query has no AI predicate; a plain "
                            "scan belongs in the database the ids came "
                            "from")
@@ -680,6 +715,15 @@ def _compile_projection(b: _Binder, expressions) -> list:
         if isinstance(e, exp.Alias):
             alias = e.alias
             e = e.this
+        if _is_call(e, "AI_EXTRACT"):
+            if not alias:
+                raise CompileError("AI.EXTRACT needs an AS name in SELECT")
+            columns.append(Alias(b.parse_ai_extract(e), alias))
+            continue
+        if any(_is_call(call, "AI_EXTRACT") for call in e.walk()):
+            raise CompileError(
+                "AI.EXTRACT in SELECT must be a direct expression with an AS name"
+            )
         if _is_call(e, "AI_SCORE"):
             if not alias:
                 raise CompileError("AI.SCORE needs an AS name in SELECT")

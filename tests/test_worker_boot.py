@@ -153,3 +153,28 @@ def test_release_clears_cuda_state_and_a_new_model_boot_triggers_it(monkeypatch)
 
     gpu2, boot2 = worker._boot_for_query(state, backend, context, 100, [1], [2])
     assert gpu2 is gpu and boot2["kind"] == "warm" and calls[-1] == "bind"
+
+
+@pytest.mark.parametrize("prepare", [False, True])
+def test_multi_gpu_native_releases_request_engine_first(monkeypatch, prepare):
+    events = []
+    state = {("request-engine", "vllm", "qwen3-4b-fp8", True): {
+        "client": SimpleNamespace(close=lambda: events.append("close")),
+    }}
+    context = SimpleNamespace(
+        gpu_count=2, runtime_state=state, request=None, graph=None, registry=None,
+    )
+    monkeypatch.setattr(worker, "quail_runtime_payload", lambda *a: {})
+
+    def execute(*args):
+        assert state == {}
+        events.append("execute")
+
+    monkeypatch.setattr(worker, "execute_quail_multi", execute)
+    if prepare:
+        worker.prepare_quail_request(context)
+        assert events == ["close"]
+    else:
+        worker.execute_quail_request(context)
+        assert events == ["close", "execute"]
+    assert state == {}

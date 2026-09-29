@@ -105,6 +105,10 @@ class SGLangClient:
             return result
         return bool(getattr(result, "success", True))
 
+    def close(self):
+        """Stop the engine before another model uses the process's GPU."""
+        self.engine.shutdown()
+
 
 def _capacity(engine) -> dict:
     info = engine.get_server_info()

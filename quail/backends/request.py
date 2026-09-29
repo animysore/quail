@@ -18,6 +18,7 @@ from quail.backends.request_scheduling import (
     true_bit,
 )
 from quail.cost import budgets
+from quail.execution.extract import extract_rows
 from quail.execution.pairs import (
     allowed_members,
     members_by_partner,
@@ -36,6 +37,7 @@ from quail.execution.runner import (
 )
 from quail.execution.types import PhysicalResponse, export_physical_outputs
 from quail.logical import (
+    Alias,
     Apply,
     effective_selectivity,
     filter_question_text,
@@ -45,6 +47,7 @@ from quail.logical import (
     shared_preamble,
 )
 from quail.physical import (
+    AiExtract,
     Limit,
     PhysicalNode,
     PortRef,
@@ -306,11 +309,27 @@ def plan_request_backend(
     else:
         sink_input = PortRef(request_node.node_id, f"ids:{aliases[0]}")
 
+    for index, column in enumerate(region.logical_plan.root.columns):
+        if not isinstance(column, Alias):
+            continue
+        call = column.expression
+        if call.kind != "extract":
+            raise ValueError("the request backend cannot project this model call")
+        extraction = AiExtract(
+            node_id=f"extract:{index}", inputs=input_ports((sink_input,)),
+            backend_name=backend_name, alias=call.aliases()[0],
+            name=column.name, fields=call.fields,
+            preamble_text=call.prompt.preamble, tail_text=call.prompt.tail,
+        )
+        nodes.append(extraction)
+        sink_input = PortRef(extraction.node_id, "rows")
+
     nodes.append(Project(
         node_id="project",
         inputs=input_ports((sink_input,)),
         columns=tuple(
-            f"{column.alias}.{column.column}"
+            column.name if isinstance(column, Alias)
+            else f"{column.alias}.{column.column}"
             for column in region.logical_plan.root.columns
         ),
     ))
@@ -335,6 +354,7 @@ def plan_request_backend(
             "true_ids": true_ids,
             "false_ids": false_ids,
             "order_rule": rule,
+            "extraction": any(isinstance(node, AiExtract) for node in nodes),
         },
     )
     return (PhysicalCandidate(
@@ -408,9 +428,10 @@ def _token_list(values) -> list[int]:
     return [int(token) for token in values]
 
 
-def _text_value(values, index: int) -> str:
+def _text_value(values, index: int) -> str | None:
     value = values[index]
-    return value.as_py() if hasattr(value, "as_py") else str(value)
+    return value.as_py() if hasattr(value, "as_py") else (
+        None if value is None else str(value))
 
 
 def _operator_at_a_time_filter(client, sampling_params, bodies, questions,
@@ -527,6 +548,7 @@ class RequestModelExecution:
         self.sampling_params = settings["sampling_params"]
         self.documents = settings["documents"]
         self.document_texts = settings.get("document_texts", {})
+        self.extraction = settings.get("extraction", False)
         self.pairs = {}         # written position -> pair table, from ports
         true_ids = set(settings["true_ids"])
         if context.model.canvas_tokens == 1:
@@ -561,6 +583,8 @@ class RequestModelExecution:
         node: PhysicalNode,
         inputs: Mapping[str, Any],
     ) -> NodeResult:
+        if isinstance(node, AiExtract):
+            return extract_rows(node, inputs, self.document_texts, self.client)
         if not isinstance(node, RequestExecution):
             raise TypeError(
                 f"request backend cannot execute {node.type_name!r}"
@@ -581,6 +605,12 @@ class RequestModelExecution:
 
         for filter_index, spec in enumerate(node.filters):
             document_ids = list(survivors[spec.alias])
+            if self.extraction:
+                texts = self.document_texts[spec.alias]
+                document_ids = [
+                    document for document in document_ids
+                    if _text_value(texts, document) is not None
+                ]
             bodies = [
                 _token_list(node.preamble_token_ids)
                 + _token_list(self.documents[spec.alias][document])
@@ -848,7 +878,10 @@ def execute_request_graph(context, backend, engine_state, boot):
         if isinstance(node, Scan)
         and context.request.inputs[node.input_id].texts is not None
     }
-    settings = dict(envelope["settings"])
+    settings = {
+        **envelope["settings"],
+        "extraction": any(isinstance(node, AiExtract) for node in context.graph.nodes),
+    }
     model_execution = backend.start(GpuContext(
         gpu_index=0,
         gpu_count=1,
@@ -885,6 +918,29 @@ def execute_request_graph(context, backend, engine_state, boot):
         if torch is not None and torch.cuda.is_available() else 0
     )
     request_result = run.nodes["request-model"]
+    backend_metrics = dict(request_result.metrics.extension)
+    extraction_metrics = [
+        run.nodes[node.node_id].metrics
+        for node in compute_graph.nodes if isinstance(node, AiExtract)
+    ]
+    if extraction_metrics:
+        backend_metrics["requests"] += sum(
+            metrics.extension["requests"] for metrics in extraction_metrics
+        )
+        backend_metrics["output_tokens"] = sum(
+            metrics.extension["output_tokens"] for metrics in extraction_metrics
+        )
+        backend_metrics["extraction_errors"] = sum(
+            metrics.extension["errors"] for metrics in extraction_metrics
+        )
+        backend_metrics["rejected_requests"] = sum(
+            metrics.extension["rejected_requests"] for metrics in extraction_metrics
+        )
+        backend_metrics["steps"] = [
+            *backend_metrics["steps"],
+            *({"kind": "extract", "wall_s": metrics.wall_s, **metrics.extension}
+              for metrics in extraction_metrics),
+        ]
     report = {
         "backend": backend.name,
         "wall_s": round(metrics.wall_s, 2),
@@ -895,7 +951,7 @@ def execute_request_graph(context, backend, engine_state, boot):
         "cached_tokens": metrics.cached_tokens,
         "peak_gib": round(peak_bytes / 2**30, 2),
         "node_metrics": scalar_node_metrics(run.nodes),
-        "backend_metrics": dict(request_result.metrics.extension),
+        "backend_metrics": backend_metrics,
     }
     return PhysicalResponse(
         export_physical_outputs(compute_graph, run),
@@ -905,7 +961,10 @@ def execute_request_graph(context, backend, engine_state, boot):
 
 def request_runtimes() -> dict:
     """Return runtimes for the request backends' physical node."""
-    return {RequestExecution.runtime_key: ModelNodeRuntime()}
+    return {
+        RequestExecution.runtime_key: ModelNodeRuntime(),
+        AiExtract.runtime_key: ModelNodeRuntime(),
+    }
 
 
 SUPPORTED_DEVICES = frozenset({"h100-sxm", "rtx-pro-6000-blackwell-server"})
@@ -919,6 +978,17 @@ def _warm_boot() -> dict:
         "kv_profile_s": None,
         "boot_s": 0.0,
     }
+
+
+def release_request_engines(runtime_state: dict) -> None:
+    """Close request engines before loading an incompatible model or mode."""
+    keys = [
+        key for key in runtime_state
+        if isinstance(key, tuple) and key and key[0] == "request-engine"
+    ]
+    for key in keys:
+        state = runtime_state.pop(key)
+        state["client"].close()
 
 
 @dataclass(frozen=True)
@@ -958,6 +1028,22 @@ class RequestBackend:
         return SupportResult.accept()
 
     def plan(self, region, context):
+        extracts = [
+            column for column in region.logical_plan.root.columns
+            if isinstance(column, Alias) and column.expression.kind == "extract"
+        ]
+        if extracts and (
+            not getattr(self.engine, "supports_extraction", False)
+            or context.model.arch != "qwen3"
+            or len(region.logical_plan.operators().scans) != 1
+        ):
+            refusal = Refusal(
+                reasons=("AI.EXTRACT requires a vLLM backend with "
+                         "a generative Qwen3 model and one input table",),
+                constraint="extract_backend_support", needed=1, available=0,
+                unit="extraction backends",
+            )
+            return (PhysicalCandidate(None, refusal, float("inf")),)
         return plan_request_backend(
             region,
             context,
@@ -972,14 +1058,28 @@ class RequestBackend:
     def execute_request(self, context):
         envelope = context.request.plan
         model = context.registry.model(envelope["model"])
-        state_key = ("request-engine", self.engine.kind, model.name)
+        extraction = any(isinstance(node, AiExtract) for node in context.graph.nodes)
+        state_key = ("request-engine", self.engine.kind, model.name, extraction)
         engine_state = context.runtime_state.get(state_key)
         if engine_state is None:
+            release_request_engines(context.runtime_state)
+            if context.runtime_state:
+                from quail.backends.quail.worker import release_booted_models
+
+                release_booted_models(context.runtime_state)
             allowed_ids = sorted(set(
                 envelope["settings"]["true_ids"]
             ) | set(envelope["settings"]["false_ids"]))
-            engine_state, boot = self.engine.boot(model, allowed_ids)
+            kwargs = {"extraction": True} if extraction else {}
+            engine_state, boot = self.engine.boot(model, allowed_ids, **kwargs)
             context.runtime_state[state_key] = engine_state
         else:
             boot = _warm_boot()
-        return execute_request_graph(context, self, engine_state, boot)
+        try:
+            return execute_request_graph(context, self, engine_state, boot)
+        except Exception as error:
+            try:
+                release_request_engines(context.runtime_state)
+            except Exception as cleanup_error:
+                error.add_note(f"Engine cleanup also failed: {cleanup_error}")
+            raise

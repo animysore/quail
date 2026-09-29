@@ -49,8 +49,8 @@ DEFAULT_SELECTIVITY = 0.2
 SCORE_COMPARISONS = ("<", "<=", ">", ">=")
 
 # what a model call answers: "boolean" is AI.IF, yes or no;
-# "score" is AI.SCORE, a float between 0 and 1
-MODEL_CALL_KINDS = ("boolean", "score")
+# "score" is AI.SCORE; "extract" returns named string fields.
+MODEL_CALL_KINDS = ("boolean", "score", "extract")
 
 
 def effective_selectivity(selectivity: Optional[float]) -> float:
@@ -67,6 +67,7 @@ class ModelCall:
     """
     prompt: Prompt
     kind: str = "boolean"
+    fields: tuple[str, ...] = ()
 
     type_name: ClassVar[str] = "quail.model_call"
 
@@ -79,6 +80,17 @@ class ModelCall:
             raise CompileError(
                 f"model call kind must be one of {MODEL_CALL_KINDS}, "
                 f"got {self.kind!r}")
+        if self.kind == "extract":
+            if not self.fields or any(
+                not isinstance(name, str) or not name.strip() for name in self.fields
+            ):
+                raise CompileError("AI.EXTRACT needs nonempty string field names")
+            if len(self.fields) != len(set(self.fields)):
+                raise CompileError("AI.EXTRACT field names must be unique")
+            if len(self.prompt.args) != 1:
+                raise CompileError("AI.EXTRACT reads one document column")
+        elif self.fields:
+            raise CompileError("field names are only supported by AI.EXTRACT")
 
 
 @dataclass(frozen=True)
@@ -418,6 +430,10 @@ def _explain(expression) -> str:
                 f"{expression.threshold}")
     if isinstance(expression, Alias):
         return f"{_explain(expression.expression)} AS {expression.name}"
+    if expression.kind == "extract":
+        document, = expression.prompt.args
+        fields = ", ".join(repr(field) for field in expression.fields)
+        return f"AI.EXTRACT({document.alias}.{document.column}, {fields})"
     function = "AI.SCORE" if expression.kind == "score" else "AI.IF"
     return f"{function}({expression.prompt.template!r})"
 

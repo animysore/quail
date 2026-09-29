@@ -59,11 +59,11 @@ interests you, open an issue and we will help you get started.
 
 ### Medium
 
-- **New AI-SQL operators.** `AI.CLASSIFY` (return one of N labels),
-  `AI.EXTRACT` (pull structured fields from a document), and
-  `AI.MAP` (run a free-form instruction and return the result).
-  These require decode (generating multiple tokens), which the
-  current engine does not do. See
+- **New AI-SQL operators.** `AI.CLASSIFY` (return one of N labels)
+  and `AI.MAP` (run a free-form instruction and return the result).
+  `AI.EXTRACT` supports named string fields through the vLLM backends;
+  adding it to the native Quail engine requires decode
+  (generating multiple tokens). See
   [Custom operators](/docs/extending/operators).
 - **Assign documents to GPUs for prefix reuse.** Each GPU can reuse
   KV only from documents on that GPU. Grouping documents with common

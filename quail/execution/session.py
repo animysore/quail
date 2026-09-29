@@ -38,6 +38,7 @@ from quail.extensions import ExtensionRegistry
 from quail.frontend.builder import Query as BuilderQuery
 from quail.frontend.sql import SQLDialect, compile_sql
 from quail.logical import (
+    Alias,
     CompileError,
     LogicalPlan,
     join_conditions,
@@ -145,6 +146,7 @@ class Session:
         self._tokenizer_name = "configured tokenizer" if tokenizer else "Gigatoken"
         self.notes = []            # tokenizer picks etc., for reports
         self._token_stores = {}
+        self._null_token_stores = set()
         self._column_stores = {}
         self._store_count = 0
         self._token_directory = None
@@ -187,6 +189,7 @@ class Session:
         for store in self._token_stores.values():
             store.close()
         self._token_stores.clear()
+        self._null_token_stores.clear()
         for store in self._column_stores.values():
             store.close()
         self._column_stores.clear()
@@ -276,7 +279,7 @@ class Session:
         return self._tok
 
     def tokenize(self, provider_name: str, column: str,
-                 projected_columns=()) -> ScanInput:
+                 projected_columns=(), *, allow_null=False) -> ScanInput:
         """Tokenize one document column and keep value columns beside it.
 
         The token file is cached per document column. Each value column
@@ -285,13 +288,16 @@ class Session:
         tokenize the documents again.
         """
         with self._lock:
-            return self._tokenize(provider_name, column, projected_columns)
+            return self._tokenize(
+                provider_name, column, projected_columns, allow_null)
 
-    def _tokenize(self, provider_name, column, projected_columns):
+    def _tokenize(self, provider_name, column, projected_columns, allow_null):
         provider = self.catalog.get(provider_name)
         identity = provider.content_identity()
         projected_columns = tuple(dict.fromkeys(projected_columns))
         token_key = (identity, column)
+        if not allow_null and token_key in self._null_token_stores:
+            raise TypeError("NULL document inputs require AI.EXTRACT")
         missing = [
             name for name in projected_columns
             if (identity, name) not in self._column_stores
@@ -301,6 +307,7 @@ class Session:
                 provider_name,
                 None if token_key in self._token_stores else column,
                 tuple(missing),
+                allow_null=allow_null,
             )
         return ScanInput(
             self._token_stores[token_key],
@@ -311,13 +318,14 @@ class Session:
         )
 
     def tokenize_async(self, provider_name: str, column: str,
-                       projected_columns=()) -> Future:
+                       projected_columns=(), *, allow_null=False) -> Future:
         """Start tokenize() on a background thread and return its Future."""
         if self._background is None:
             self._background = ThreadPoolExecutor(
                 max_workers=1, thread_name_prefix="quail-tokenize")
         return self._background.submit(
-            self.tokenize, provider_name, column, projected_columns)
+            self.tokenize, provider_name, column, projected_columns,
+            allow_null=allow_null)
 
     def register_functions(self, functions: dict) -> None:
         """Register a query's apply() functions once each, by name."""
@@ -373,7 +381,7 @@ class Session:
         sample = []
         try:
             for batch in reader:
-                texts = batch.column(0)
+                texts = pc.fill_null(batch.column(0), "")
                 byte_lengths.append(pc.binary_length(texts).cast(pa.int64()))
                 if len(sample) < ESTIMATE_SAMPLE:
                     sample.extend(
@@ -397,8 +405,10 @@ class Session:
             f"sample, {time.perf_counter() - started:.1f} s")
         return lengths
 
-    def _corpus_tokenizer(self, provider_name, column, texts):
+    def _corpus_tokenizer(self, provider_name, column, texts, allow_null):
         """Cache the session tokenizer and token type for one column."""
+        if not allow_null and any(text is None for text in texts):
+            raise TypeError("NULL document inputs require AI.EXTRACT")
         key = (self.catalog.get(provider_name).content_identity(), column)
         if key not in self._corpus_tokenizers:
             tok = self.tokenizer
@@ -406,7 +416,8 @@ class Session:
                 f"{provider_name}.{column}: tokenizer: {self._tokenizer_name}"
             )
             first_token = next(
-                (token for text in texts for token in tok(text)), None
+                (token for text in texts if text is not None or not allow_null
+                 for token in tok(text)), None
             )
             token_type = (
                 pa.int32()
@@ -427,7 +438,7 @@ class Session:
             / f"input-{self._store_count}.arrow"
         )
 
-    def _pick_tokenizer(self, reader, provider_name: str, column: str):
+    def _pick_tokenizer(self, reader, provider_name: str, column: str, allow_null):
         """Sample the first documents to choose a tokenizer and token type."""
         buffered = []
         text_sample = []
@@ -441,11 +452,11 @@ class Session:
             needed = 25 - len(text_sample)
             text_sample.extend(texts.slice(0, needed).to_pylist())
         tok, token_type = self._corpus_tokenizer(
-            provider_name, column, text_sample)
+            provider_name, column, text_sample, allow_null)
         return buffered, tok, token_type
 
     def _load(self, provider_name: str, column: str | None,
-              value_columns: tuple[str, ...]) -> None:
+              value_columns: tuple[str, ...], *, allow_null=False) -> None:
         """Scan the provider once and write the missing store files.
 
         Args:
@@ -453,6 +464,7 @@ class Session:
             column: The document column to tokenize, or None when its
                 token file already exists.
             value_columns: Value columns without a column file yet.
+            allow_null: Preserve NULL inputs for an extraction query.
         """
         provider = self.catalog.get(provider_name)
         identity = provider.content_identity()
@@ -462,18 +474,20 @@ class Session:
         scan_reader = provider.scan(ScanRequest(columns=scan_columns))
         reader = iter(scan_reader)
         token_writer = None
+        has_null = False
         column_writers = {}
         writers = []
         try:
             batches = reader
             if column is not None:
                 buffered, tok, token_type = self._pick_tokenizer(
-                    reader, provider_name, column)
+                    reader, provider_name, column, allow_null)
                 batches = chain(buffered, reader)
                 token_writer = TokenStoreWriter(
                     self._store_path(),
                     document_column=column,
-                    tokenizer=tok,
+                    tokenizer=(lambda text: [] if text is None else tok(text))
+                    if allow_null else tok,
                     token_type=token_type,
                 )
                 writers.append(token_writer)
@@ -491,6 +505,12 @@ class Session:
             for batch in batches:
                 for start in range(0, batch.num_rows, TOKENIZE_ROWS):
                     piece = batch.slice(start, TOKENIZE_ROWS)
+                    if token_writer is not None:
+                        nulls = piece.column(
+                            piece.schema.get_field_index(column)).null_count
+                        if nulls and not allow_null:
+                            raise TypeError("NULL document inputs require AI.EXTRACT")
+                        has_null = has_null or bool(nulls)
                     for writer in writers:
                         writer.write_batch(piece)
                     rows += piece.num_rows
@@ -532,6 +552,8 @@ class Session:
                     f"does not scan in a stable order")
         if token_store is not None:
             self._token_stores[(identity, column)] = token_store
+            if has_null:
+                self._null_token_stores.add((identity, column))
         for name, store in column_stores.items():
             self._column_stores[(identity, name)] = store
 
@@ -625,6 +647,10 @@ class Query:
             )
             operators = self.logical.operators()
             scans, joins = operators.scans, operators.joins
+            allow_null = any(
+                isinstance(column, Alias) and column.expression.kind == "extract"
+                for column in self.logical.root.columns
+            )
             self._doc_tokens = {}
             self._token_inputs = {}
             estimated = []
@@ -637,14 +663,14 @@ class Query:
                 exact = self.session.token_lengths(s.provider, s.column)
                 if exact is not None:
                     store = self.session.tokenize(
-                        s.provider, s.column, columns)
+                        s.provider, s.column, columns, allow_null=allow_null)
                     self._token_inputs[s.alias] = store
                     self._doc_tokens[s.alias] = store.lengths
                     continue
                 self._doc_tokens[s.alias] = self.session.estimate_lengths(
                     s.provider, s.column)
                 future = self.session.tokenize_async(
-                    s.provider, s.column, columns)
+                    s.provider, s.column, columns, allow_null=allow_null)
 
                 def record_finished(_future, alias=s.alias):
                     self._token_finished_at[alias] = time.perf_counter()

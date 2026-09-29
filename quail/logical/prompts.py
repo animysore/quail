@@ -1,5 +1,7 @@
 """Prompt text, prompt token ids, and template binding."""
 
+import json
+
 from quail.logical.nodes import CompileError, Prompt
 
 # Fixed preamble before every document. Must be a formatting label,
@@ -257,6 +259,30 @@ def bind_score_prompt(template: str, args: tuple,
             f"each AI.SCORE placeholder must name a distinct table, got "
             f"aliases {aliases}")
     return Prompt(template=template, args=tuple(args), preamble="", tail="")
+
+
+def bind_extract_prompt(document, fields: tuple[str, ...], tokenizer=None,
+                        turn: tuple[str, str] = ("", "")) -> Prompt:
+    """Bind field extraction while preserving the shared document prefix."""
+    preamble = shared_preamble(turn[0])
+    instruction = (
+        "\n\nExtract these fields from the document above: "
+        + json.dumps(fields, ensure_ascii=False)
+        + ". Return one JSON object with exactly these keys. "
+        "Each value must be a string copied from the document, or null "
+        "if the information is absent. Do not invent values. "
+        "Return only the JSON object.\nANSWER:"
+    )
+    tail = instruction + turn[1]
+    pre_ids = tuple(tokenizer(preamble)) if tokenizer is not None else ()
+    tail_ids = tuple(tokenizer(tail)) if tokenizer is not None else ()
+    return Prompt(
+        template="{0}" + instruction, args=(document,),
+        preamble=preamble, tail=tail,
+        preamble_tokens=len(pre_ids) if tokenizer is not None else None,
+        tail_tokens=len(tail_ids) if tokenizer is not None else None,
+        preamble_token_ids=pre_ids, tail_token_ids=tail_ids,
+    )
 
 
 def bind_join_prompt(template: str, args: tuple,

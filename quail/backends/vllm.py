@@ -12,6 +12,7 @@ from quail.backends.request_scheduling import (
     MAX_SEQUENCES,
     run_filter_chain,
 )
+from quail.execution.extract import GenerationResult
 
 GPU_MEMORY_UTILIZATION = 0.91
 CUDA_GRAPH_CAPTURE_SIZE = 8_192
@@ -42,6 +43,36 @@ class GigatokenVLLMTokenizer:
         tokenizer.max_token_id = max(vocab.values())
         tokenizer.max_chars_per_token = max(len(token) for token in vocab)
         return tokenizer
+
+
+def register_gigatoken():
+    """Register Quail's tokenizer and renderer in each vLLM process."""
+    from vllm.renderers.registry import RENDERER_REGISTRY
+    from vllm.tokenizers import TokenizerRegistry
+
+    registered = ("quail.backends.vllm", "GigatokenVLLMTokenizer")
+    if TokenizerRegistry.tokenizers.get("gigatoken") != registered:
+        TokenizerRegistry.register("gigatoken", *registered)
+    renderer = ("vllm.renderers.hf", "HfRenderer")
+    if RENDERER_REGISTRY.renderers.get("gigatoken") != renderer:
+        RENDERER_REGISTRY.register("gigatoken", *renderer)
+
+
+def _require_gigatoken_plugin():
+    from importlib.metadata import entry_points
+
+    from vllm import envs
+
+    plugins = entry_points(group="vllm.general_plugins", name="quail_gigatoken")
+    if not any(plugin.value == "quail.backends.vllm:register_gigatoken"
+               for plugin in plugins):
+        raise RuntimeError(
+            "Gigatoken requires Quail's vLLM plugin. Reinstall quail-engine "
+            "from this checkout so its entry-point metadata is current.")
+    allowed = envs.VLLM_PLUGINS
+    if allowed is not None and "quail_gigatoken" not in allowed:
+        raise RuntimeError(
+            "Gigatoken requires quail_gigatoken in the VLLM_PLUGINS allowlist.")
 
 
 @contextmanager
@@ -129,6 +160,35 @@ def sampling_kwargs(allowed_ids: list[int], canvas_tokens: int = 0) -> dict:
             "allowed_token_ids": allowed_ids, "detokenize": False}
 
 
+def _extraction_kwargs(spec, extraction: bool) -> dict:
+    if not extraction:
+        return {}
+    return {
+        "tokenizer_mode": "auto",
+        "revision": spec.revision,
+        "tokenizer_revision": spec.revision,
+        "structured_outputs_config": {
+            "backend": "xgrammar", "disable_any_whitespace": False,
+        },
+    }
+
+
+def _generation_result(output) -> GenerationResult:
+    """Convert vLLM completion state without exposing it to row assembly."""
+    prompt_tokens = len(output.prompt_token_ids or ())
+    cached_tokens = int(output.num_cached_tokens or 0)
+    output_tokens = sum(len(answer.token_ids) for answer in output.outputs)
+    if not output.finished or len(output.outputs) != 1:
+        return GenerationResult(
+            "", "incomplete", prompt_tokens, cached_tokens, output_tokens,
+        )
+    answer = output.outputs[0]
+    return GenerationResult(
+        answer.text, answer.finish_reason, prompt_tokens,
+        cached_tokens, output_tokens,
+    )
+
+
 class VLLMClient:
     """The request operations the backends need from one vLLM LLM."""
 
@@ -141,8 +201,55 @@ class VLLMClient:
     def generate(self, prompts, sampling_params, use_tqdm=False):
         return self.llm.generate(prompts, sampling_params, use_tqdm=use_tqdm)
 
+    def generate_structured(self, prompts, schema, max_tokens):
+        """Generate JSON using vLLM's public structured-output interface."""
+        from vllm import SamplingParams
+        from vllm.sampling_params import StructuredOutputsParams
+
+        if max_tokens <= 0:
+            raise ValueError("Extraction output limit must be positive")
+        if not prompts:
+            return []
+        tokenizer = self.llm.get_tokenizer()
+        limit = min(
+            self.capacity["max_model_len"], self.capacity["kv_cache_size_tokens"],
+        )
+        positions, inputs = [], []
+        results = [GenerationResult("", "context", 0) for _ in prompts]
+        for position, prompt in enumerate(prompts):
+            tokens = tokenizer.encode(prompt, add_special_tokens=False)
+            if not tokens or len(tokens) + max_tokens > limit:
+                continue
+            positions.append(position)
+            inputs.append({"prompt_token_ids": tokens})
+        if not inputs:
+            return results
+        params = SamplingParams(
+            temperature=0.0, max_tokens=max_tokens,
+            structured_outputs=StructuredOutputsParams(json=schema),
+        )
+        outputs = self.generate(inputs, params, use_tqdm=False)
+        if len(outputs) != len(positions):
+            raise RuntimeError("vLLM returned the wrong number of extraction rows")
+        for position, output in zip(positions, outputs):
+            results[position] = _generation_result(output)
+        return results
+
     def reset_prefix_cache(self):
         return self.llm.reset_prefix_cache()
+
+    def close(self):
+        """Stop engine workers and release their CUDA and distributed state."""
+        if self.llm is None:
+            return
+        from vllm.distributed.parallel_state import cleanup_dist_env_and_memory
+
+        llm, self.llm = self.llm, None
+        try:
+            llm.llm_engine.engine_core.shutdown()
+        finally:
+            del llm
+            cleanup_dist_env_and_memory()
 
     def run_filter_chain(self, sampling_params, body_ids, question_ids,
                          read_answer, *, tag="q", body_texts=None,
@@ -170,8 +277,9 @@ class VLLMEngine:
     kind = "vllm"
     label = "vLLM"
     runtime_package = "vllm==0.26.0"
+    supports_extraction = True
 
-    def llm_kwargs(self, spec) -> dict:
+    def llm_kwargs(self, spec, *, extraction: bool = False) -> dict:
         """Return the LLM constructor arguments beyond the model name.
 
         A spec with its own chunk cap (a mixture-of-experts model)
@@ -193,23 +301,18 @@ class VLLMEngine:
                              else MAX_SEQUENCES),
         }
         kwargs.update(diffusion_kwargs(spec))
+        kwargs.update(_extraction_kwargs(spec, extraction))
         return kwargs
 
-    def boot(self, spec, allowed_ids: list[int]) -> tuple[dict, dict]:
+    def boot(self, spec, allowed_ids: list[int], *,
+             extraction: bool = False) -> tuple[dict, dict]:
         """Load the spec's model and return the engine state and boot record."""
         from vllm import LLM, SamplingParams
-        from vllm.renderers.registry import RENDERER_REGISTRY
-        from vllm.tokenizers import TokenizerRegistry
 
-        registered = (
-            "quail.backends.vllm", "GigatokenVLLMTokenizer"
-        )
-        if TokenizerRegistry.tokenizers.get("gigatoken") != registered:
-            TokenizerRegistry.register("gigatoken", *registered)
-        renderer = ("vllm.renderers.hf", "HfRenderer")
-        if RENDERER_REGISTRY.renderers.get("gigatoken") != renderer:
-            RENDERER_REGISTRY.register("gigatoken", *renderer)
-
+        load_kwargs = self.llm_kwargs(spec, extraction=extraction)
+        if load_kwargs.get("tokenizer_mode") == "gigatoken":
+            _require_gigatoken_plugin()
+        register_gigatoken()
         if spec.canvas_tokens == 1:
             # vLLM's engine core in its own process returns the canvas
             # row's logprobs unreliably under the step loop on long
@@ -219,24 +322,46 @@ class VLLMEngine:
             os.environ["VLLM_ENABLE_V1_MULTIPROCESSING"] = "0"
         started = time.perf_counter()
         with diffusion_canvas(spec) as canvas_ids:
-            llm = LLM(model=spec.hf_name, **self.llm_kwargs(spec))
+            client = VLLMClient(LLM(
+                model=spec.hf_name, **load_kwargs,
+            ), {})
         boot_s = time.perf_counter() - started
-        sampling_params = SamplingParams(
-            **sampling_kwargs(allowed_ids, spec.canvas_tokens))
-        capacity = _capacity(llm)
-        cache = llm.llm_engine.vllm_config.cache_config
-        capacity.update(
-            enable_prefix_caching=cache.enable_prefix_caching,
-            input_tokenizer_mode=(
-                llm.llm_engine.vllm_config.model_config.tokenizer_mode
-            ),
-            canvas_length=spec.canvas_tokens,
-            initial_canvas_token_ids=list(canvas_ids),
-            max_denoising_steps=1 if spec.canvas_tokens == 1 else None,
-            logprobs=sampling_params.logprobs,
-        )
-        client = VLLMClient(llm, capacity)
-        client.generate(["TRUE"], sampling_params)
+        try:
+            sampling_params = SamplingParams(
+                **sampling_kwargs(allowed_ids, spec.canvas_tokens))
+            capacity = _capacity(client.llm)
+            config = client.llm.llm_engine.vllm_config
+            capacity.update(
+                enable_prefix_caching=config.cache_config.enable_prefix_caching,
+                input_tokenizer_mode=config.model_config.tokenizer_mode,
+                canvas_length=spec.canvas_tokens,
+                initial_canvas_token_ids=list(canvas_ids),
+                max_denoising_steps=1 if spec.canvas_tokens == 1 else None,
+                logprobs=sampling_params.logprobs,
+                extraction=extraction,
+            )
+            if extraction:
+                from importlib.metadata import version
+
+                structured = config.structured_outputs_config
+                capacity.update(
+                    model_revision=config.model_config.revision,
+                    tokenizer_revision=config.model_config.tokenizer_revision,
+                    structured_outputs_backend=structured.backend,
+                    structured_outputs_disable_any_whitespace=(
+                        structured.disable_any_whitespace
+                    ),
+                    xgrammar_version=version("xgrammar"),
+                    extraction_add_special_tokens=False,
+                )
+            client.capacity = capacity
+            client.generate(["TRUE"], sampling_params)
+        except Exception as error:
+            try:
+                client.close()
+            except Exception as cleanup_error:
+                error.add_note(f"Engine cleanup also failed: {cleanup_error}")
+            raise
         return (
             {
                 "client": client,
@@ -256,17 +381,16 @@ class VLLMEngine:
 class DefaultVLLMEngine(VLLMEngine):
     """Boot vLLM with every engine setting at its default.
 
-    Only the model name is passed, as `vllm serve Qwen/Qwen3-4B-FP8`
-    would, plus the canvas a diffusion model's readout needs. The
-    engine kind differs from `VLLMEngine` so this engine never shares
-    a loaded model with the tuned vLLM backends.
+    Filter queries pass the model name and any diffusion canvas settings.
+    Extraction also pins model/tokenizer revisions and selects HF tokenization
+    and XGrammar. The engine kind differs from `VLLMEngine` so this engine never
+    shares a loaded model with the tuned vLLM backends.
     """
 
     kind = "dumb_vllm"
     label = "vLLM with default settings"
-
-    def llm_kwargs(self, spec) -> dict:
-        return diffusion_kwargs(spec)
+    def llm_kwargs(self, spec, *, extraction: bool = False) -> dict:
+        return diffusion_kwargs(spec) | _extraction_kwargs(spec, extraction)
 
 
 def stock_vllm_backend() -> RequestBackend:

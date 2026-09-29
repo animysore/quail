@@ -196,6 +196,9 @@ def _single_gpu_context(registry, envelope):
 def _boot_for_query(runtime_state, backend, gpu_context,
                     chunk_tokens, true_ids, false_ids, arena_pages=None):
     """Load or reuse a GPU, bind a query, warm kernels."""
+    from quail.backends.request import release_request_engines
+
+    release_request_engines(runtime_state)
     key = (backend.name, gpu_context.model.name)
     gpu = runtime_state.get(key)
     t_boot = time.perf_counter()
@@ -220,6 +223,9 @@ def _boot_for_query(runtime_state, backend, gpu_context,
 
 def prepare_quail_request(context) -> None:
     """Boot one GPU from the plan alone; the documents can arrive later."""
+    from quail.backends.request import release_request_engines
+
+    release_request_engines(context.runtime_state)
     if context.gpu_count != 1:
         return
     envelope = context.request.plan
@@ -235,6 +241,9 @@ def prepare_quail_request(context) -> None:
 
 def execute_quail_request(context):
     """Run one Quail request from a backend execution context."""
+    from quail.backends.request import release_request_engines
+
+    release_request_engines(context.runtime_state)
     payload = quail_runtime_payload(context.request, context.graph)
     if context.gpu_count == 1:
         backend = context.registry.backend(context.request.plan["backend"])

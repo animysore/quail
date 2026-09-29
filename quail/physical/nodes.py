@@ -442,6 +442,56 @@ class ScoreSpec:
 
 
 @dataclass(frozen=True)
+class AiExtract(PhysicalNode):
+    """Append named string fields from each input document."""
+
+    backend_name: str = ""
+    alias: str = ""
+    name: str = ""
+    fields: tuple[str, ...] = ()
+    preamble_text: str = ""
+    tail_text: str = ""
+    max_output_tokens: int = 512
+
+    type_name: ClassVar[str] = "quail.ai_extract"
+    runtime_key: ClassVar[str] = type_name
+    location: ClassVar[ExecutionLocation] = ExecutionLocation.GPU_EXECUTOR
+
+    @property
+    def backend(self) -> str:
+        return self.backend_name
+
+    @property
+    def outputs(self) -> tuple[OutputPort, ...]:
+        return (OutputPort("rows", ValueType.ROWS),)
+
+    def attributes(self) -> dict:
+        return {
+            "backend_name": self.backend_name,
+            "alias": self.alias,
+            "name": self.name,
+            "fields": list(self.fields),
+            "preamble_text": self.preamble_text,
+            "tail_text": self.tail_text,
+            "max_output_tokens": self.max_output_tokens,
+        }
+
+    def explain_fields(self) -> Mapping[str, Any]:
+        return {
+            "backend": self.backend_name, "alias": self.alias,
+            "output": self.name, "fields": list(self.fields),
+            "max_output_tokens": self.max_output_tokens,
+        }
+
+    @classmethod
+    def from_attributes(cls, node_id, inputs, attributes):
+        return cls(
+            node_id=node_id, inputs=inputs,
+            **{**attributes, "fields": tuple(attributes["fields"])},
+        )
+
+
+@dataclass(frozen=True)
 class AiScore(PhysicalNode):
     """Append one FLOAT64 reranker score to candidate rows."""
 

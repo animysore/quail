@@ -71,8 +71,10 @@ CI runs these on every pull request. Run them before pushing:
 - Filter and join queries on Qwen3 4B fp8, Qwen3 32B fp8, or
   DiffusionGemma 26B-A4B fp8, on one H100 per model copy. No
   tensor-parallel weight sharding.
-- `AI.CLASSIFY`, `AI.EXTRACT`, and `AI.MAP` are on the roadmap.
-  Open-ended generation, speculation, and forking are not supported.
+- `AI.EXTRACT` supports field-name-only SQL projections through `dumb_vllm`,
+  `stock_vllm`, and `pipelined_vllm` with generative Qwen3 models. Native execution,
+  `AI.CLASSIFY`, and `AI.MAP` are on the roadmap. Open-ended generation,
+  speculation, and forking are not supported.
 
 # What Quail builds on and learns from
 

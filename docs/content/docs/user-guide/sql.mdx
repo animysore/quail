@@ -284,16 +284,61 @@ FROM reviews r
 
 ### AI.EXTRACT
 
-<Callout type="info">Coming soon</Callout>
-
-Pull structured fields out of each document, like Snowflake's
-[AI_EXTRACT](https://docs.snowflake.com/en/user-guide/snowflake-cortex/aisql).
-Example:
+Extract named fields from one text column. Supply the field names as string
+literals and give the result an `AS` name:
 
 ```sql
-SELECT AI.EXTRACT(r.body, 'movie_title', 'rating') AS extracted
+SELECT r.id, AI.EXTRACT(r.body, 'movie_title', 'rating') AS extracted
 FROM reviews r
 ```
+
+`AI_EXTRACT` is also accepted. Both spellings work in Quail's `snowflake`
+and `bq` dialects. This field-name-only syntax is Quail's API; it does not
+implement the full Snowflake or Databricks extraction interface.
+
+Use a generative Qwen3 model with `dumb_vllm`, `stock_vllm`, or
+`pipelined_vllm`:
+
+```python
+config = quail.EngineConfig(
+    model="qwen3-4b-fp8",
+    device="h100-sxm",
+    backend="dumb_vllm",
+)
+```
+
+The result is an Arrow struct with `response` and `error` fields. Every
+requested field in `response` is a nullable string. For example, a review
+that names Arrival and rates it 4/5 can produce:
+
+```json
+{
+  "response": {"movie_title": "Arrival", "rating": "4/5"},
+  "error": null
+}
+```
+
+- Field names must be nonempty, unique string literals. They describe what
+  to extract; this version does not accept types, nested schemas, or questions.
+- Missing information is represented by a `null` field value. A SQL `NULL`
+  document returns SQL `NULL` without a model request. If the extraction
+  query has a Boolean filter, NULL documents are excluded before inference.
+- Invalid output or generation that exhausts the 512-token output limit
+  without a valid stop returns `response: null` and an `error` string.
+  If a prompt plus that output allowance cannot fit the engine's context
+  or KV capacity, it returns a per-row error before generation.
+- Generation is constrained to the requested JSON structure and validated
+  before conversion to Arrow. The extracted facts can still be incorrect.
+- A query can extract multiple sets of fields from the same document column.
+  Boolean `AI.IF` / `AI_FILTER` predicates run first, and extraction runs
+  on surviving rows. `LIMIT` limits returned rows, not extraction requests.
+- This version supports one table on one GPU. Joins, `AI.SCORE` in the same
+  query, the native `quail` backend, SGLang, and DiffusionGemma are unsupported.
+- Extraction uses the model specification's pinned checkpoint/tokenizer
+  revisions, the Hugging Face tokenizer, greedy decoding, and XGrammar.
+  For tuned vLLM, this tokenizer applies to the whole extraction query,
+  including its filters. Switching between extraction and filter-only
+  configurations reloads the engine; startup is reported separately.
 
 ### AI.MAP
 
@@ -313,8 +358,8 @@ FROM reviews r
 
 These work the way you expect from standard SQL:
 
-- **`SELECT`** lists columns. `*` expands to all columns. No
-  expressions or computed aliases.
+- **`SELECT`** lists columns. `*` expands to all columns. `AI.SCORE`
+  and `AI.EXTRACT` may also be returned with an `AS` name.
 - **`FROM`** names a registered table, with an optional alias.
 - **`JOIN`** and `CROSS JOIN` are supported. Outer joins (`LEFT`,
   `RIGHT`, `FULL`) are not.

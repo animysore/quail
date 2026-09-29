@@ -19,6 +19,7 @@ from .codec import (
     plan_envelope,
 )
 from .nodes import (
+    AiExtract,
     AiFilter,
     AiJoin,
     AiScore,
@@ -41,6 +42,7 @@ from .nodes import (
 )
 
 __all__ = [
+    "AiExtract",
     "AiJoin",
     "AiScore",
     "Scan",

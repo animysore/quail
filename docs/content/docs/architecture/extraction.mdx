@@ -3,9 +3,9 @@ title: Extraction design
 description: Proposed native Qwen3 decoding and a shared extraction contract.
 ---
 
-This is an implementation proposal. Native extraction is not implemented yet.
-The uncommitted prototype on `feat/ai-extract` runs through `dumb_vllm`; its SQL
-surface and extraction operator are not included in this documentation commit.
+This is a proposal for native extraction, which is not implemented yet.
+The SQL surface and shared extraction operator run through `dumb_vllm`,
+`stock_vllm`, and `pipelined_vllm`.
 The first native version targets generative Qwen3 4B and 32B on one GPU.
 DiffusionGemma is a later follow-up requiring its own generation design.
 
@@ -27,13 +27,16 @@ Every requested field is present in a successful response. Its value is a string
 or NULL when the document does not provide it. Failed or truncated generation
 sets `response` to NULL and supplies an error. A SQL NULL input produces SQL NULL
 and makes no model request.
+When an extraction query has Boolean filters, NULL documents are excluded
+before inference. Queries without extraction keep their existing NULL-input
+refusal.
 
 The initial scope is one table with optional Boolean filters and one or more
 extraction projections. Filters select rows before extraction. Extraction keeps
 the surviving row IDs and any previously computed columns. Joins, combinations
 with `AI.SCORE`, and multiple GPUs remain outside this first version.
-In the uncommitted prototype, `LIMIT` limits returned rows, not extraction
-requests. Keep that behavior in the first implementation.
+`LIMIT` limits returned rows, not extraction requests.
+Keep that behavior in the first native implementation.
 
 ## One contract across backends
 
@@ -41,10 +44,10 @@ Share prompt construction, JSON schema, result validation, row assembly, and
 metrics between `quail`, `dumb_vllm`, `stock_vllm`, and `pipelined_vllm`.
 Keep engine-specific generation inside each adapter.
 
-The uncommitted prototype's `quail/execution/extract.py` reads vLLM's
-`RequestOutput` directly. Replace that dependency with a small generation
-result containing text, finish status, prompt token count, cached input token
-count, and output token count. The shared validator checks complete JSON,
+`quail/execution/extract.py` uses a backend-neutral `GenerationResult`
+containing text, finish status, prompt token count, cached input token
+count, and output token count. The vLLM adapter converts `RequestOutput`
+to that record. The shared validator checks complete JSON,
 exact field names, string/NULL values, duplicate keys, and successful
 termination.
 
@@ -59,7 +62,7 @@ Accept a valid stop at the limit; exhausting the budget before accepted
 termination is an error, even if the partial text parses as JSON. Test this
 boundary against vLLM's `max_tokens` behavior. A stop token is not forwarded;
 reserving prompt length plus the output limit is a conservative KV bound.
-Keep the prototype's 512-token limit initially. Precheck lengths before vLLM
+Keep the 512-token limit initially. Precheck lengths before vLLM
 batch submission so one oversized prompt can produce a per-row error without
 failing otherwise valid rows.
 
@@ -167,7 +170,7 @@ another query; freeing KV alone is not recovery.
 
 ## Integration and validation gates
 
-Integrate the prototype's `AiExtract` node with native planning, runtime
+Integrate the `AiExtract` node with native planning, runtime
 registration, source-document preparation, worker boot, and node dispatch.
 Preserve source IDs until final projection. Filters in an extraction query
 must use the same generation-capable memory budget as its full-head load.
@@ -218,8 +221,7 @@ Development takes place on `animysore/quail`, branch `feat/ai-extract`.
 Each milestone is tested, reviewed with Claude Code Opus 5.5 at `xhigh`,
 corrected as needed, committed, and pushed to that branch.
 
-1. Land the prototype's SQL surface, `AiExtract`, and `dumb_vllm` support,
-   together with the shared generation contract and the other two vLLM
+1. SQL surface, `AiExtract`, the shared generation contract, and all three vLLM
    configurations. Save named smoke fixtures, expected fields, and a vLLM
    reference run with backend, model/tokenizer revisions, and output limit
    for native validation in milestone 3.

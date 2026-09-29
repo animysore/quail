@@ -7,6 +7,7 @@ from typing import Any, Mapping
 
 from .base import InputPort, PhysicalGraph, PhysicalNode, PortRef, ValueType
 from .nodes import (
+    AiExtract,
     AiFilter,
     AiJoin,
     AiScore,
@@ -136,6 +137,7 @@ def built_in_codecs() -> tuple[NodeCodec, ...]:
     return tuple(NodeCodec(node_type) for node_type in (
         Scan,
         AiFilter,
+        AiExtract,
         RequestExecution,
         AiScore,
         ScoreFilter,
