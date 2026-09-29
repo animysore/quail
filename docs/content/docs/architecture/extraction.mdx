@@ -1,0 +1,235 @@
+---
+title: Extraction design
+description: Proposed native Qwen3 decoding and a shared extraction contract.
+---
+
+This is an implementation proposal. Native extraction is not implemented yet.
+The uncommitted prototype on `feat/ai-extract` runs through `dumb_vllm`; its SQL
+surface and extraction operator are not included in this documentation commit.
+The first native version targets generative Qwen3 4B and 32B on one GPU.
+DiffusionGemma is a later follow-up requiring its own generation design.
+
+## Query and result
+
+```sql
+SELECT d.id, AI.EXTRACT(d.body, 'vendor', 'total') AS extracted
+FROM documents d
+```
+
+The field names describe what to extract. Each non-NULL input produces a struct
+with `response` and `error`:
+
+```json
+{"response": {"vendor": "Acme", "total": "$42"}, "error": null}
+```
+
+Every requested field is present in a successful response. Its value is a string
+or NULL when the document does not provide it. Failed or truncated generation
+sets `response` to NULL and supplies an error. A SQL NULL input produces SQL NULL
+and makes no model request.
+
+The initial scope is one table with optional Boolean filters and one or more
+extraction projections. Filters select rows before extraction. Extraction keeps
+the surviving row IDs and any previously computed columns. Joins, combinations
+with `AI.SCORE`, and multiple GPUs remain outside this first version.
+In the uncommitted prototype, `LIMIT` limits returned rows, not extraction
+requests. Keep that behavior in the first implementation.
+
+## One contract across backends
+
+Share prompt construction, JSON schema, result validation, row assembly, and
+metrics between `quail`, `dumb_vllm`, `stock_vllm`, and `pipelined_vllm`.
+Keep engine-specific generation inside each adapter.
+
+The uncommitted prototype's `quail/execution/extract.py` reads vLLM's
+`RequestOutput` directly. Replace that dependency with a small generation
+result containing text, finish status, prompt token count, cached input token
+count, and output token count. The shared validator checks complete JSON,
+exact field names, string/NULL values, duplicate keys, and successful
+termination.
+
+Each backend must encode the same complete prompt using the same checkpoint
+and tokenizer revisions and explicit special-token behavior. Do not assume that
+concatenating separately tokenized document and instruction fragments produces
+the same token IDs. Record these settings in validation results.
+All four configurations use greedy decoding (`temperature=0`).
+
+The output limit bounds generated tokens, including an emitted stop token.
+Accept a valid stop at the limit; exhausting the budget before accepted
+termination is an error, even if the partial text parses as JSON. Test this
+boundary against vLLM's `max_tokens` behavior. A stop token is not forwarded;
+reserving prompt length plus the output limit is a conservative KV bound.
+Keep the prototype's 512-token limit initially. Precheck lengths before vLLM
+batch submission so one oversized prompt can produce a per-row error without
+failing otherwise valid rows.
+
+The tuned vLLM backends currently use Gigatoken's HF-compatible wrapper, which
+the installed XGrammar rejects. For extraction queries, use a supported HF
+tokenizer through vLLM's public configuration. Include that choice in engine
+boot compatibility, and release an incompatible loaded engine before starting
+another one. The whole extraction query, including its filters, uses that
+engine. Preserve the existing tuned settings for queries that do not extract.
+Extraction requests can initially use operator-at-a-time
+submission even when preceding filters use pipelining.
+
+## Native execution
+
+Quail already owns model forwarding, paged attention, and KV allocation.
+Extend these with a serial generation loop rather than a new serving engine:
+
+1. Encode the complete prompt and check the context and KV capacity limits.
+2. Reserve private KV capacity for the prompt and bounded output.
+3. Prefill the prompt in chunks through `Qwen3Pipeline.forward_chunk`.
+4. Use the final prompt hidden state to score the next token.
+5. Apply the JSON grammar mask and select the highest-scoring allowed token.
+6. Feed that token through the model at the next position, reading the same KV.
+7. Repeat until valid termination or a limit, then release the private KV.
+
+Prefill processes each prompt token once. Each decode step processes one new
+token. The sequence's initialized KV length advances after successful forwards;
+reserved capacity is not evidence that those positions contain valid KV.
+Track that initialized length in the decode loop: `KVArena.activate` updates
+its own token count before the forward, so that count cannot prove completion.
+The first generated token comes from the last prefill position. It must not
+require forwarding the prompt's last token a second time.
+
+Use unified paged attention first. `pack_chunk` and `KVArena.activate` appear to
+support appending fresh tokens to a resident key, but their suffix and temporary
+page behavior must be tested before depending on it. Prefill must use a paged
+group, with reserved capacity covering every decode position. Each decode step
+must use the single-suffix direct-write path or fail the query: the alternative
+writes suffix KV to temporary pages that `_forward` frees before the next step.
+Assert that no temporary suffix pages were used. Put the decode loop beside the
+existing operator loops; keep filter and join scheduling separate.
+Use one group shape for prefill and decode:
+`{key, prefix: None, f: initialized_length, suffixes: [new_token_ids]}`.
+Here the key is already paged, and `new_token_ids` is either a prompt chunk
+or one generated token. Use a private key outside the alias/document prefix
+namespace and free it in `finally`.
+
+Each row gets private KV. The first version does not reuse filter KV, share KV
+between documents, batch decoding, or overlap prefill and decode. It still
+reuses KV within every generated response.
+
+## Output weights and model lifetime
+
+The native loader currently copies TRUE/FALSE output rows and drops `lm_head`.
+Extraction needs the full output projection. Add an explicit load capability,
+while keeping the small Boolean readout for filters in a mixed query.
+
+Qwen3 4B ties its output head to the input embeddings. Retain that shared
+reference without cloning a second vocabulary matrix. Qwen3 32B has an untied
+head; retaining its BF16 weights adds approximately 1.45 GiB relative to the
+current answer-only load.
+
+Planner and worker budgets must agree about retained weights, logits, grammar
+masks, and decoding scratch before allocating KV. Computing one vocabulary
+logit row per sequence is sufficient; do not project every prefill position.
+Respect the loaded model's output projection rules and valid vocabulary IDs,
+including the distinction between real token IDs and padded weight rows.
+
+Determine generation capability from the whole query before model boot. A
+filter followed by extraction uses one generation-capable model. Warm model
+reuse must check capability as well as model identity.
+
+Store capability on the loaded model, retaining the existing two-element
+runtime key. For an untied head, release and reload on incompatible load modes
+in either direction. Reusing an answer-only load for extraction loses the head;
+retaining a full head with answer-only memory budgets can overallocate KV.
+For Qwen3 4B, retain or rebind the tied output head and verify it shares the
+embedding weights, avoiding a reload or matrix copy.
+Never keep two full model copies resident merely to support both modes.
+Refuse multi-GPU extraction at planning time until its separate worker
+lifecycle supports the capability check.
+
+## Constrained decoding and failures
+
+Use XGrammar's public tokenizer, compiler, matcher, and token-mask interfaces.
+Compile the field schema once for a compatible tokenizer; each row needs its
+own matcher state. Match the vocabulary and stop-token configuration to the
+actual model and tokenizer.
+Match the XGrammar version, whitespace options, and stop-token IDs used by
+vLLM's structured-output backend. Record these options alongside the schema;
+the schema alone does not fully specify the constrained decoding behavior.
+
+Mask logits before greedy selection, then advance the matcher with the chosen
+token. Follow the matcher and EOS termination contract. A closing brace alone
+is not a termination test. Validate the finished text again before constructing
+the Arrow result.
+
+An output limit, context refusal, or invalid generated response produces an
+explicit per-row error. Grammar/tokenizer configuration failures fail the query.
+CUDA failures also fail the query and invalidate unusable warm state.
+Always release owned pages during cleanup. Do not turn runtime failures into
+successful missing-field NULLs.
+An unusable CUDA context requires replacing the worker process before running
+another query; freeing KV alone is not recovery.
+
+## Integration and validation gates
+
+Integrate the prototype's `AiExtract` node with native planning, runtime
+registration, source-document preparation, worker boot, and node dispatch.
+Preserve source IDs until final projection. Filters in an extraction query
+must use the same generation-capable memory budget as its full-head load.
+Carry the original document texts through the session's tokenized input and
+native worker payload even when the text column is not projected. Build and
+tokenize the full extraction prompt on the worker; gate that its token IDs
+match vLLM's recorded prompt IDs.
+
+Warm the one-token forward and full-head projection before measured execution.
+Include generation capability in the warm-up marker and update its version
+when these shapes are added.
+
+Before accepting the native path, verify:
+
+- Known token sequences through prefill and successive one-token forwards,
+  including multi-chunk prompts and KV page boundaries.
+- One-token kernel shapes, causal positions, valid vocabulary masking,
+  tied/untied output heads, and complete-versus-truncated grammar output.
+- NULL and empty inputs, escaped text, missing fields, multiple projections,
+  filtered rows, context limits, and cleanup after failed requests.
+- Cold and warm execution, plus filter-only, mixed extraction, and filter-only
+  queries in sequence, with consistent load capabilities and KV budgets.
+- Real GPU extraction on both Qwen3 sizes and all four backend configurations,
+  using the same prompts, model revisions, and output limits.
+- Existing filter and join tests and representative GPU regressions.
+
+Require valid structures for every non-NULL smoke input, expected errors for
+deliberate limit cases, exact prompt-token agreement, and no unexplained KV or
+memory failures. Compare teacher-forced incremental logits against a full
+forward with an explicitly recorded numerical tolerance. Investigate field
+agreement regressions against the saved `dumb_vllm` smoke reference before
+accepting the native milestone; do not lower the acceptance bar to pass a run.
+
+Compare structural validity and exact field agreement with saved references.
+Different kernels can produce different greedy outputs; do not assume
+bit-identical results. Report query time excluding startup, requested input
+tokens per second, output tokens, startup separately, and the benchmark's
+reference GPU cost: query hours times GPU count times
+`quail.specs.H100_USD_PER_HOUR`, reported as dollars per query. Record the rate
+used and distinguish it from actual instance billing.
+Distinguish GPU measurements from CPU-only tests.
+Keep generated-token work separate from input-token metrics; decoding must not
+inflate requested-input throughput or appear as recomputed prompt tokens.
+
+## Implementation milestones
+
+Development takes place on `animysore/quail`, branch `feat/ai-extract`.
+Each milestone is tested, reviewed with Claude Code Opus 5.5 at `xhigh`,
+corrected as needed, committed, and pushed to that branch.
+
+1. Land the prototype's SQL surface, `AiExtract`, and `dumb_vllm` support,
+   together with the shared generation contract and the other two vLLM
+   configurations. Save named smoke fixtures, expected fields, and a vLLM
+   reference run with backend, model/tokenizer revisions, and output limit
+   for native validation in milestone 3.
+2. Native full-head loading, consistent budgets, and verified serial decode.
+3. Native planner/runtime integration and end-to-end extraction validation.
+4. Engine-neutral extraction queries, references, and scoring in `quail-bench`,
+   followed by the Quail benchmark adapter and an explicit dependency-pin update.
+
+After correctness is established, measure decode batching and then prefix
+sharing between filters and extraction or between documents.
+The earlier baseline validation uses a separate unmodified upstream checkout
+at `41b883b838687cfbf018080f068f3e81bf2f8e64`. Preserve that checkout and its
+saved results; feature validation is a separate set of runs.

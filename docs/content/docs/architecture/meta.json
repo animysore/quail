@@ -6,7 +6,8 @@
     "physical-plans",
     "planning",
     "execution",
-    "prefix-caching"
+    "prefix-caching",
+    "extraction"
   ],
   "defaultOpen": false
 }
