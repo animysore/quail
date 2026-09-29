@@ -28,6 +28,7 @@ from quail.execution.runner import (
 from quail.execution.tokens import DocumentPrefixes, chain_tokens
 from quail.execution.types import export_physical_outputs
 from quail.physical import (
+    AiExtract,
     AiFilter,
     AiJoin,
     AiScore,
@@ -199,6 +200,14 @@ def filter_document_sink(node, document_ids):
 
 def filter_inputs(state, node, document_ids) -> dict:
     """Scheduler inputs for one filter chain over the given documents."""
+    if state.get("generation"):
+        texts = state["document_texts"][node.alias]
+        live = []
+        for index in document_ids:
+            text = texts[index]
+            if text.is_valid if hasattr(text, "is_valid") else text is not None:
+                live.append(index)
+        document_ids = live
     return {
         "documents": DocumentPrefixes(
             state["pre"], state["docs"][node.alias], document_ids
@@ -212,6 +221,11 @@ def filter_inputs(state, node, document_ids) -> dict:
 
 def prepare_model_inputs(node, inputs, context: ExecutionContext):
     """Prepare Quail scheduler inputs from typed port values."""
+    if isinstance(node, AiExtract):
+        arena = context.state["arena"]
+        for key in arena.resident_keys():
+            arena.free_key(key)
+        return {"rows": inputs, "document_texts": context.state["document_texts"]}
     if isinstance(node, AiScore):
         return {"score_inputs": inputs, "documents": context.state["docs"]}
     if not isinstance(node, (AiFilter, AiJoin)):
@@ -422,8 +436,9 @@ def execute_single_graph(state, payload, graph: PhysicalGraph) -> dict:
         **state,
         "pre": payload.get("pre_ids") or [],
         "retention": retention,
+        "generation": any(isinstance(node, AiExtract) for node in graph.nodes),
         "filter_limit": (
-            None if any(isinstance(node, AiJoin)
+            None if any(isinstance(node, (AiJoin, AiExtract))
                         for node in graph.nodes)
             else payload.get("filter_limit")
         ),
@@ -446,15 +461,17 @@ def execute_single_graph(state, payload, graph: PhysicalGraph) -> dict:
         functions=state.get("functions", {}),
     )
     started = time.perf_counter()
-    with torch.inference_mode():
-        result = GenericRunner().run(compute_subgraph(graph), context)
-    torch.cuda.synchronize()
+    try:
+        with torch.inference_mode():
+            result = GenericRunner().run(compute_subgraph(graph), context)
+        torch.cuda.synchronize()
+    finally:
+        for key in arena.resident_keys():
+            arena.free_key(key)
     wall = time.perf_counter() - started
 
     filters, joins = model_answers(graph, result)
 
-    for key in arena.resident_keys():
-        arena.free_key(key)
     kv_manager = {
         **runtime_state["kv_stats"],
         "evicted_keys": arena.evicted_keys,
@@ -485,6 +502,9 @@ def execute_single_graph(state, payload, graph: PhysicalGraph) -> dict:
         "kv_manager": kv_manager,
         "peak_gib": round(torch.cuda.max_memory_allocated() / 2**30, 2),
     }
+    if runtime_state["generation"]:
+        report["backend_metrics"].update(
+            extraction_metrics(graph, result, runtime_state, filters))
     report.update(throughput(graph, result.metrics, wall))
     if state.get("gpu_timing"):
         # seconds a forward chunk was running on the GPU, summed over
@@ -492,6 +512,34 @@ def execute_single_graph(state, payload, graph: PhysicalGraph) -> dict:
         report["gpu_s"] = round(result.metrics.gpu_s, 3)
         report["chunks"] = result.metrics.chunks
     return report
+
+
+def extraction_metrics(graph, result, state, filters) -> dict:
+    """Count requested input and generated output for an extraction query."""
+    steps = [
+        {"kind": "extract", "wall_s": value.metrics.wall_s,
+         **value.metrics.extension}
+        for node_id, value in result.nodes.items()
+        if isinstance(graph.node(node_id), AiExtract)]
+    requests = prompt_tokens = 0
+    for node in graph.nodes:
+        if not isinstance(node, AiFilter):
+            continue
+        for document, answers in filters[node.alias].items():
+            prefix = len(state["pre"]) + len(state["docs"][node.alias][document])
+            requests += len(answers)
+            prompt_tokens += sum(
+                prefix + len(question)
+                for question in node.question_token_ids[:len(answers)])
+    return {
+        "steps": steps,
+        "requests": requests + sum(step["requests"] for step in steps),
+        "prompt_tokens": prompt_tokens + sum(step["prompt_tokens"] for step in steps),
+        "output_tokens": sum(step["output_tokens"] for step in steps),
+        "extraction_errors": sum(step["errors"] for step in steps),
+        "rejected_requests": sum(step["rejected_requests"] for step in steps),
+        "generation_config": dict(state["model_execution"].generation_metadata),
+    }
 
 
 def throughput(graph, metrics, seconds: float) -> dict:

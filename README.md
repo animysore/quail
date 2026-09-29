@@ -105,7 +105,8 @@ See [Quail Server](https://fsdatalab.github.io/quail/docs/user-guide/server).
 
 Quail currently supports AI-powered filters, joins, and
 `EXISTS` / `NOT EXISTS`. `AI.EXTRACT` returns named string fields
-through the vLLM backends with generative Qwen3 models.
+through native Quail and the vLLM backends with generative Qwen3
+4B or 32B on one GPU.
 We are actively adding more operators (`AI.CLASSIFY`, `AI.MAP`).
 
 We support two AI-SQL dialects:

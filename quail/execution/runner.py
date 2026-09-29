@@ -14,6 +14,7 @@ from quail.execution.result import (
     true_answer_rows,
 )
 from quail.physical import (
+    AiExtract,
     Barrier,
     Exchange,
     ExecutionLocation,
@@ -741,6 +742,7 @@ class HashJoinRuntime:
 def built_in_runtimes() -> dict[str, NodeRuntime]:
     """Return runtimes for the backend independent physical nodes."""
     return {
+        AiExtract.runtime_key: ModelNodeRuntime(),
         Scan.runtime_key: ScanRuntime(),
         Barrier.runtime_key: BarrierRuntime(),
         Exchange.runtime_key: ExchangeRuntime(),

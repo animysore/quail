@@ -656,7 +656,7 @@ class Query:
             estimated = []
             for s in scans:
                 columns = s.columns
-                if self.session.config.backend in {
+                if allow_null or self.session.config.backend in {
                     "stock_vllm", "pipelined_vllm", "dumb_vllm"
                 }:
                     columns = tuple(dict.fromkeys((*columns, s.column)))

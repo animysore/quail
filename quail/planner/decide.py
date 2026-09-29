@@ -8,6 +8,7 @@ from quail.cost.sol import speed_of_light, unrounded_seconds
 from quail.cost.work import Work, ask, scan
 from quail.logical import (
     DEFAULT_SELECTIVITY,
+    Alias,
     CompileError,
     LogicalPlan,
     effective_selectivity,
@@ -15,6 +16,7 @@ from quail.logical import (
     oriented_join_conditions,
 )
 from quail.physical import (
+    AiExtract,
     AiFilter,
     AiJoin,
     Barrier,
@@ -359,6 +361,9 @@ def plan_quail(plan: LogicalPlan, *, model: ModelSpec,
     """
     operators = plan.operators()
     scans, filters, joins = operators.scans, operators.filters, operators.joins
+    generation = any(
+        isinstance(column, Alias) and column.expression.kind == "extract"
+        for column in plan.root.columns)
     applies = operators.applies
     alias_applies = {}
     join_applies = {}
@@ -389,7 +394,8 @@ def plan_quail(plan: LogicalPlan, *, model: ModelSpec,
     for s in scans:
         if s.alias not in stats:
             raise ValueError(f"no doc_tokens for alias {s.alias!r}")
-    remarks = []
+    remarks = (["AI.EXTRACT prefill and decode are not included in cost estimates"]
+               if generation else [])
 
     # ---- refusals first
     weight_gpus = budgets.minimum_weight_gpus(model, device)
@@ -403,11 +409,12 @@ def plan_quail(plan: LogicalPlan, *, model: ModelSpec,
             needed=weight_gpus, available=1, unit="cards")
     workers = gpus
 
-    chunk = budgets.chunk_budget(model, device)
+    chunk = budgets.chunk_budget(model, device, generation=generation)
     # the longest documents bind the sliding-pool split
     longest_mean = max(
         (st.mean_doc_tokens for st in stats.values()), default=None)
-    arena_split = budgets.arena_pages(model, device, chunk, longest_mean)
+    arena_split = budgets.arena_pages(
+        model, device, chunk, longest_mean, generation=generation)
     admission = arena_split[0] * budgets.PAGE_TOKENS
     pre = preamble_tokens(filters, joins)
     specs = join_specs(joins, pair_fractions, model.canvas_tokens)
@@ -733,10 +740,25 @@ def plan_quail(plan: LogicalPlan, *, model: ModelSpec,
         sink_inputs = (PortRef("recombine", "tuples"),)
     else:
         sink_inputs = (ids_src[scans[0].alias],)
+    for index, column in enumerate(plan.root.columns):
+        if not isinstance(column, Alias):
+            continue
+        call = column.expression
+        if call.kind != "extract":
+            raise ValueError("Quail cannot project this model call")
+        node = AiExtract(
+            node_id=f"extract:{index}", inputs=input_ports(sink_inputs),
+            backend_name="quail", alias=call.aliases()[0],
+            name=column.name, fields=call.fields,
+            preamble_text=call.prompt.preamble, tail_text=call.prompt.tail)
+        nodes.append(node)
+        sink_inputs = (PortRef(node.node_id, "rows"),)
     nodes.append(PhysicalProject(
         node_id="project",
         inputs=input_ports(tuple(sink_inputs)),
-        columns=tuple(f"{c.alias}.{c.column}" for c in plan.root.columns)))
+        columns=tuple(
+            c.name if isinstance(c, Alias) else f"{c.alias}.{c.column}"
+            for c in plan.root.columns)))
     if plan.root.limit is not None:
         nodes.append(Limit(
             node_id="limit",
@@ -761,6 +783,7 @@ def plan_quail(plan: LogicalPlan, *, model: ModelSpec,
         backend="quail", estimated_seconds=estimate,
         nodes=tuple(nodes), remarks=tuple(remarks),
         settings={
+            "generation": generation,
             "chunk_tokens": chunk,
             "arena_pages": list(arena_split),
             "admission_tokens": admission,

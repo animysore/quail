@@ -7,6 +7,7 @@ per GPU, each with its own CUDA context and arena.
 import gc
 import itertools
 import time
+import traceback
 
 from quail.backends.base import GpuContext
 from quail.backends.quail.distributed import execute_distributed_graph
@@ -36,6 +37,7 @@ from quail.execution.tokens import (
 )
 from quail.execution.types import PhysicalResponse
 from quail.physical import (
+    AiExtract,
     AiFilter,
     AiJoin,
     Scan,
@@ -127,6 +129,7 @@ class LoadedGpu:
             return
         if not self.spec.tied_head:
             raise ValueError("Changing an untied head's mode requires a reload")
+        self.execution.clear_generation()
         retain_answer_head(
             self.torch, self.model, self.model.quail_answer_token_ids,
             generation=generation)
@@ -211,15 +214,23 @@ def quail_runtime_payload(request, graph) -> dict:
     """Build private Quail scheduler state from a standard request."""
     envelope = request.plan
     docs = {}
+    document_texts = {}
+    generation = any(isinstance(node, AiExtract) for node in graph.nodes)
     for node in graph.nodes:
         if not isinstance(node, Scan):
             continue
         docs[node.alias] = request.inputs[node.input_id].documents
+        if generation:
+            texts = request.inputs[node.input_id].texts
+            if texts is None:
+                raise ValueError("Native AI.EXTRACT requires original document text")
+            document_texts[node.alias] = texts
     return {
         "physical_plan": envelope,
         "model": envelope["model"],
         "workers": envelope["workers"],
         "docs": docs,
+        "document_texts": document_texts,
         "columns": request.column_tables(),
         **dict(envelope["settings"]),
     }
@@ -268,11 +279,7 @@ def _boot_for_query(runtime_state, backend, gpu_context,
         warm_s, warm_tier = gpu.warm()
     except Exception as error:
         gpu = None
-        try:
-            release_booted_models(runtime_state)
-        except Exception as cleanup_error:
-            error.add_note(f"Native cleanup also failed: {cleanup_error}")
-            runtime_state.clear()
+        _release_failed_models(runtime_state, error)
         raise
     boot = _boot_record(gpu, cold, warm_s, warm_tier, t_boot)
     say(f"model ready, boot {boot['boot_s']} s ({boot['kind']})")
@@ -283,6 +290,7 @@ def prepare_quail_request(context) -> None:
     """Boot one GPU from the plan alone; the documents can arrive later."""
     from quail.backends.request import release_request_engines
 
+    _validate_generation_request(context)
     release_request_engines(context.runtime_state)
     if context.gpu_count != 1:
         return
@@ -301,8 +309,9 @@ def execute_quail_request(context):
     """Run one Quail request from a backend execution context."""
     from quail.backends.request import release_request_engines
 
-    release_request_engines(context.runtime_state)
+    _validate_generation_request(context)
     payload = quail_runtime_payload(context.request, context.graph)
+    release_request_engines(context.runtime_state)
     if context.gpu_count == 1:
         backend = context.registry.backend(context.request.plan["backend"])
         return execute_quail_payload(
@@ -310,6 +319,18 @@ def execute_quail_request(context):
             context.runtime_state,
         )
     return execute_quail_multi(payload, context.registry, context.graph)
+
+
+def _validate_generation_request(context):
+    envelope = context.request.plan
+    generation = any(isinstance(node, AiExtract) for node in context.graph.nodes)
+    if generation != bool(envelope["settings"].get("generation", False)):
+        raise ValueError("Native generation settings must match the physical graph")
+    if generation:
+        gpu_context = _single_gpu_context(context.registry, envelope)
+        _generation_requested(gpu_context)
+        if context.gpu_count != 1:
+            raise ValueError("Native generation requires generative Qwen3 on one GPU")
 
 
 def _release_vllm_parallel_state() -> None:
@@ -323,6 +344,25 @@ def _release_vllm_parallel_state() -> None:
 
     destroy_model_parallel()
     destroy_distributed_environment()
+
+
+def _release_failed_models(runtime_state, error):
+    """Clear failed-frame locals and release native GPU state."""
+    pending, seen = [error], set()
+    while pending:
+        current = pending.pop()
+        if current is None or id(current) in seen:
+            continue
+        seen.add(id(current))
+        traceback.clear_frames(current.__traceback__)
+        pending.extend((current.__cause__, current.__context__))
+        if isinstance(current, BaseExceptionGroup):
+            pending.extend(current.exceptions)
+    try:
+        release_booted_models(runtime_state)
+    except Exception as cleanup_error:
+        error.add_note(f"Native cleanup also failed: {cleanup_error}")
+        runtime_state.clear()
 
 
 def release_booted_models(runtime_state: dict) -> dict:
@@ -354,7 +394,11 @@ def release_booted_models(runtime_state: dict) -> dict:
 
 
 def execute_quail_payload(payload, registry, graph, backend, runtime_state):
-    """Execute one Quail payload on the worker's own GPU."""
+    """Execute one payload, invalidating cached models on any graph failure.
+
+    This includes filter-only and join queries, even when a CPU UDF raises.
+    The next query boots a fresh model.
+    """
     gpu_context = _single_gpu_context(registry, payload["physical_plan"])
 
     key = (backend.name, gpu_context.model.name)
@@ -372,8 +416,13 @@ def execute_quail_payload(payload, registry, graph, backend, runtime_state):
             payload.get("arena_pages"))
     say("running the query")
 
-    state = _gpu_state(gpu)
-    report = execute_single(state, payload, registry, graph)
+    try:
+        state = _gpu_state(gpu)
+        report = execute_single(state, payload, registry, graph)
+    except Exception as error:
+        state = gpu = None
+        _release_failed_models(runtime_state, error)
+        raise
     outputs = report.pop("_outputs")
     report.pop("filters", None)
     report.pop("joins", None)
@@ -398,6 +447,7 @@ def execute_single(state, payload: dict, registry, graph) -> dict:
     runtime_state = {
         **state,
         "docs": decode_payload_documents(payload["docs"]),
+        "document_texts": payload.get("document_texts", {}),
         "columns": payload.get("columns", {}),
         "functions": registry.functions,
         "runtimes": registry.runtimes,

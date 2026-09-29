@@ -54,6 +54,7 @@ class ExtractClient:
 
     def __init__(self):
         self.calls = []
+        self.filter_prompts = []
         self.replies = {}
         self.closed = False
 
@@ -64,6 +65,7 @@ class ExtractClient:
         self.closed = True
 
     def generate(self, prompts, sampling_params, use_tqdm=False):
+        self.filter_prompts.extend(prompts)
         outputs = []
         for prompt in prompts:
             output = _output("", prompt_tokens=len(_tokens(prompt)))
@@ -210,6 +212,9 @@ def test_extract_results_missing_fields_and_null_documents(session, client, back
     assert metrics.fresh_tokens + metrics.cached_tokens == \
         metrics.extension["prompt_tokens"]
     assert result.report["backend_metrics"]["requests"] == 2
+    assert result.report["backend_metrics"]["prompt_tokens"] == (
+        sum(len(_tokens(prompt)) for prompts, _, _ in client.calls
+            for prompt in prompts))
     assert result.report["backend_metrics"]["output_tokens"] == 6
     assert result.report["backend_metrics"]["extraction_errors"] == 0
     assert result.execute_stream(batch_rows=1).read_all().equals(result.collect())
@@ -246,6 +251,10 @@ def test_extract_filters_skip_null_documents(session, client, backend, texts):
     assert result.report["backend_metrics"]["requests"] == (
         3 if len(texts) == 3 else 0
     )
+    assert result.report["backend_metrics"]["prompt_tokens"] == (
+        sum(len(_tokens(prompt)) for prompt in client.filter_prompts)
+        + sum(len(_tokens(prompt)) for prompts, _, _ in client.calls
+              for prompt in prompts))
     assert sum(len(prompts) for prompts, _, _ in client.calls) == (
         1 if len(texts) == 3 else 0
     )
@@ -368,7 +377,7 @@ def test_extract_rejects_unsupported_query_shapes(session, sql):
 
 
 @pytest.mark.parametrize("backend,model", [
-    ("quail", "qwen3-4b-fp8"),
+    ("quail", "diffusion-gemma-26b-a4b-fp8"),
     ("pipelined_sglang", "qwen3-4b-fp8"),
     ("dumb_vllm", "diffusion-gemma-26b-a4b-fp8"),
 ])

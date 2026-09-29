@@ -924,6 +924,7 @@ def execute_request_graph(context, backend, engine_state, boot):
         for node in compute_graph.nodes if isinstance(node, AiExtract)
     ]
     if extraction_metrics:
+        backend_metrics["prompt_tokens"] = metrics.fresh_tokens + metrics.cached_tokens
         backend_metrics["requests"] += sum(
             metrics.extension["requests"] for metrics in extraction_metrics
         )
@@ -963,7 +964,6 @@ def request_runtimes() -> dict:
     """Return runtimes for the request backends' physical node."""
     return {
         RequestExecution.runtime_key: ModelNodeRuntime(),
-        AiExtract.runtime_key: ModelNodeRuntime(),
     }
 
 

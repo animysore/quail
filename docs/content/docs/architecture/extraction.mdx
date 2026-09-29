@@ -1,13 +1,12 @@
 ---
 title: Extraction design
-description: Proposed native Qwen3 decoding and a shared extraction contract.
+description: Native Qwen3 decoding and a shared extraction contract.
 ---
 
-Native full-head loading and a serial decoder are implemented as executor
-primitives. Native SQL extraction is not connected to them yet.
-The SQL surface and shared extraction operator run through `dumb_vllm`,
-`stock_vllm`, and `pipelined_vllm`.
-The first native version targets generative Qwen3 4B and 32B on one GPU.
+The SQL surface and shared extraction operator run through native `quail`,
+`dumb_vllm`, `stock_vllm`, and `pipelined_vllm`.
+Native execution uses full-head loading and a serial decoder for generative
+Qwen3 4B and 32B on one GPU.
 DiffusionGemma is a later follow-up requiring its own generation design.
 
 ## Query and result
@@ -37,7 +36,6 @@ extraction projections. Filters select rows before extraction. Extraction keeps
 the surviving row IDs and any previously computed columns. Joins, combinations
 with `AI.SCORE`, and multiple GPUs remain outside this first version.
 `LIMIT` limits returned rows, not extraction requests.
-Keep that behavior in the first native implementation.
 
 ## One contract across backends
 
@@ -119,8 +117,8 @@ reuses KV within every generated response.
 
 The native loader keeps TRUE/FALSE output rows for Boolean readout. Its
 `generation` capability also retains `lm_head` for full-vocabulary projection.
-Filter-only loads keep the existing reduced-head behavior. The native SQL
-integration must determine this capability from the entire query before boot.
+Filter-only loads keep the existing reduced-head behavior. The native planner
+determines this capability from the entire query before boot.
 
 Qwen3 4B ties its output head to the input embeddings. Retain that shared
 reference without cloning a second vocabulary matrix. Qwen3 32B has an untied
@@ -147,6 +145,15 @@ Never keep two full model copies resident merely to support both modes.
 Refuse multi-GPU extraction at planning time until its separate worker
 lifecycle supports the capability check.
 
+Loaded models outlive individual `Session` objects within the same process.
+Compatible queries reuse the model, arena, tokenizer, and grammar compiler.
+Native extraction releases any retained filter KV before starting its private
+per-row generation. Closing a session does not unload the process's model.
+Changing backends or models, or encountering a failed native query, releases
+incompatible cached state. Native Qwen3 4B rebinds its tied head when switching
+between filter-only and extraction queries; Qwen3 32B reloads its untied head
+in both directions. The vLLM adapters reload when switching those query modes.
+
 ## Constrained decoding and failures
 
 Use XGrammar's public tokenizer, compiler, matcher, and token-mask interfaces.
@@ -165,8 +172,16 @@ the Arrow result.
 An output limit, context refusal, or invalid generated response produces an
 explicit per-row error. Grammar/tokenizer configuration failures fail the query.
 CUDA failures also fail the query and invalidate unusable warm state.
+Every exception during single-GPU native graph execution unloads its cached
+model, including CPU UDF failures in ordinary filter and join queries.
+The following query loads a fresh model. Cleanup clears failed-frame locals
+through exception causes, contexts, and groups while preserving their stack
+locations and messages.
 Always release owned pages during cleanup. Do not turn runtime failures into
 successful missing-field NULLs.
+Native extraction queries also reject an oversized Boolean filter prompt before
+forwarding it through the model. This fails the query because a filter requires
+a Boolean answer; extraction prompt length failures remain per-row errors.
 An unusable CUDA context requires replacing the worker process before running
 another query; freeing KV alone is not recovery.
 
@@ -216,6 +231,15 @@ used and distinguish it from actual instance billing.
 Distinguish GPU measurements from CPU-only tests.
 Keep generated-token work separate from input-token metrics; decoding must not
 inflate requested-input throughput or appear as recomputed prompt tokens.
+For queries containing extraction, `backend_metrics.prompt_tokens`
+counts each evaluated filter prefix again for each predicate, plus each
+extraction prompt, on both native and vLLM backends. `fresh_tokens` continues
+to count actual uncached input work.
+`backend_metrics.output_tokens` reports generated extraction tokens separately.
+Extraction prefill and decode are not yet included in planner cost estimates;
+the physical plan states that limitation.
+Node-level `evaluated_documents` counts the requests for that operator; two
+extraction projections evaluate each surviving document twice.
 
 ## Implementation milestones
 

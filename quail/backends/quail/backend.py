@@ -13,12 +13,14 @@ from quail.backends.quail.executor.models import supported_archs
 from quail.backends.quail.executor.score import QuailScorer
 from quail.backends.quail.graph import filter_result, stage_partner_lists
 from quail.backends.quail.worker import execute_quail_request, prepare_quail_request
+from quail.execution.extract import extract_rows
 from quail.execution.reranker import RerankerModelExecution
 from quail.execution.runner import NodeMetrics, NodeResult, SurvivorStream
 from quail.execution.tokens import DocumentKeys, prefix_tree
 from quail.logical import Alias, is_score, shared_preamble
 from quail.logical.prompts import true_false_token_ids
 from quail.physical import (
+    AiExtract,
     AiFilter,
     AiJoin,
     AiScore,
@@ -44,11 +46,17 @@ class QuailModelExecution:
         self.context = context
         self._state: dict[str, Any] = {}
         self._reranker: RerankerModelExecution | None = None
+        self._generator = None
 
     @property
     def state(self) -> Mapping[str, Any]:
         """Return Quail's private loaded model state."""
         return self._state
+
+    @property
+    def generation_metadata(self) -> Mapping[str, Any]:
+        """Return the loaded generator's model, tokenizer, and grammar settings."""
+        return self._generator.metadata if self._generator is not None else {}
 
     def bind_loaded_model(self, *, model, arena, pipeline) -> None:
         """Attach the loaded model objects owned by this executor."""
@@ -58,6 +66,11 @@ class QuailModelExecution:
         """Drop every reference to the loaded model so its memory can go."""
         self._state.clear()
         self._reranker = None
+        self._generator = None
+
+    def clear_generation(self) -> None:
+        """Drop generator references before changing the loaded head."""
+        self._generator = None
 
     def bind_query(self, *, torch, async_answers, answer_rows,
                    chunk_tokens: int) -> None:
@@ -72,12 +85,29 @@ class QuailModelExecution:
             answer_rows=answer_rows,
             chunk_tokens=chunk_tokens,
         )
+        model = self._state["model"]
+        if getattr(model, "quail_generation", False):
+            if self._generator is None:
+                from quail.backends.quail.executor.generate import QuailGenerator
+
+                self._generator = QuailGenerator(
+                    torch, model, self._state["arena"], self._state["pipeline"],
+                    self.context.model, chunk_tokens)
+            else:
+                self._generator.chunk_tokens = chunk_tokens
+        else:
+            self.clear_generation()
 
     def execute(
         self,
         node: PhysicalNode,
         inputs: Mapping[str, Any],
     ) -> Any:
+        if isinstance(node, AiExtract):
+            if self._generator is None:
+                raise RuntimeError("AI.EXTRACT requires a generation-capable model")
+            return extract_rows(
+                node, inputs["rows"], inputs["document_texts"], self._generator)
         if isinstance(node, AiScore):
             execution = self._reranker_execution(inputs["documents"])
             if "score_rows" in inputs:
@@ -124,6 +154,12 @@ class QuailModelExecution:
         chunk_tokens = self._state["chunk_tokens"]
 
         if isinstance(node, AiFilter):
+            if self._generator is not None:
+                question = max(map(len, node.question_token_ids), default=0)
+                if any(len(document) + question > self._generator.context_limit
+                       for document in inputs["documents"]):
+                    raise ValueError(
+                        "A filter prompt exceeds the extraction model's context limit")
             document_ids = inputs["document_ids"]
             if node.pin_survivors:
                 stream = SurvivorStream(node, document_ids)
@@ -350,17 +386,10 @@ class QuailBackend:
     ) -> tuple[PhysicalCandidate, ...]:
 
         operators = region.logical_plan.operators()
-        if any(
+        has_extract = any(
             isinstance(expression, Alias) and expression.expression.kind == "extract"
             for expression in region.logical_plan.root.columns
-        ):
-            refusal = Refusal(
-                reasons=("AI.EXTRACT requires dumb_vllm, stock_vllm, "
-                         "or pipelined_vllm",),
-                constraint="extract_needs_vllm", needed=1, available=0,
-                unit="extraction backends",
-            )
-            return (PhysicalCandidate(None, refusal, float("inf")),)
+        )
         has_score = any(
             is_score(predicate.expression)
             for predicates in operators.filters.values()
@@ -369,6 +398,17 @@ class QuailBackend:
             isinstance(expression, Alias) and is_score(expression)
             for expression in region.logical_plan.root.columns
         )
+        if has_extract and (
+            context.model.arch != "qwen3" or context.model.role != "generative"
+            or context.gpu_count != 1 or len(operators.scans) != 1
+            or operators.joins or has_score
+        ):
+            refusal = Refusal(
+                reasons=("Native AI.EXTRACT requires generative Qwen3, one GPU "
+                         "and one input table, without joins or AI.SCORE",),
+                constraint="extract_backend_support", needed=1, available=0,
+                unit="extraction backends")
+            return (PhysicalCandidate(None, refusal, float("inf")),)
         if context.model.role == "reranker":
             if not has_score:
                 refusal = Refusal(
@@ -467,7 +507,7 @@ class QuailBackend:
                 "pre_ids": pre_ids,
                 "filter_limit": (
                     None if any(
-                        isinstance(node, AiJoin)
+                        isinstance(node, (AiJoin, AiExtract))
                         for node in encoded_nodes
                     ) else region.logical_plan.root.limit
                 ),

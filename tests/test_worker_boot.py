@@ -3,6 +3,7 @@
 import contextlib
 import sys
 import types
+import weakref
 from types import SimpleNamespace
 
 import pytest
@@ -10,6 +11,7 @@ import pytest
 from quail.backends.quail import worker
 from quail.backends.quail.worker import LoadedGpu
 from quail.builtins import built_in_registry
+from quail.physical import AiExtract
 
 
 def install_fake_torch(monkeypatch):
@@ -70,6 +72,7 @@ def test_prepared_boot_is_handed_to_the_query_and_used_once(
     worker.prepare_quail_request(SimpleNamespace(
         gpu_count=1, registry=registry, runtime_state=runtime_state,
         request=SimpleNamespace(plan=ENVELOPE),
+        graph=SimpleNamespace(nodes=()),
     ))
 
     gpu = runtime_state[("quail", "qwen3-4b-fp8")]
@@ -164,7 +167,9 @@ def test_multi_gpu_native_releases_request_engine_first(monkeypatch, prepare):
         "client": SimpleNamespace(close=lambda: events.append("close")),
     }}
     context = SimpleNamespace(
-        gpu_count=2, runtime_state=state, request=None, graph=None, registry=None,
+        gpu_count=2, runtime_state=state,
+        request=SimpleNamespace(plan={**ENVELOPE, "workers": 2}),
+        graph=SimpleNamespace(nodes=()), registry=built_in_registry(),
     )
     monkeypatch.setattr(worker, "quail_runtime_payload", lambda *a: {})
 
@@ -262,6 +267,7 @@ def test_tied_head_return_to_filter_keeps_warm_kernels(monkeypatch):
     gpu.spec = SimpleNamespace(tied_head=True)
     gpu.torch = object()
     gpu.model = SimpleNamespace(quail_answer_token_ids=[1, 2])
+    gpu.execution = SimpleNamespace(clear_generation=lambda: None)
     gpu.generation, gpu._warmed = True, True
     gpu.prepared_boot = {"kind": "warm"}
     calls = []
@@ -352,3 +358,87 @@ def test_prepared_boot_cannot_bypass_generation_mode_transition(
         payload, registry, object(), registry.backend("quail"), state)
     assert boots == [generation]
     assert response.metrics["boot_kind"] == "cold"
+
+
+@pytest.mark.parametrize("prepare", [False, True])
+@pytest.mark.parametrize("gpu_count", [1, 2])
+def test_generation_entry_points_refuse_before_releasing_engines(
+        monkeypatch, prepare, gpu_count):
+    model = ("diffusion-gemma-26b-a4b-fp8" if gpu_count == 1 else "qwen3-4b-fp8")
+    client = SimpleNamespace(close=lambda: pytest.fail("released a cached engine"))
+    state = {("request-engine", "vllm", "qwen3-4b-fp8", True): {"client": client}}
+    envelope = {
+        **ENVELOPE, "model": model, "workers": gpu_count,
+        "settings": {**ENVELOPE["settings"], "generation": True}}
+    context = SimpleNamespace(
+        gpu_count=gpu_count, runtime_state=state,
+        registry=built_in_registry(), request=SimpleNamespace(plan=envelope),
+        graph=SimpleNamespace(nodes=(AiExtract(node_id="extract"),)))
+    execute = worker.prepare_quail_request if prepare else worker.execute_quail_request
+    with pytest.raises(ValueError, match="generative Qwen3 on one GPU"):
+        execute(context)
+    assert len(state) == 1
+
+
+@pytest.mark.parametrize("prepare", [False, True])
+def test_generation_settings_must_match_the_graph(prepare):
+    context = SimpleNamespace(
+        request=SimpleNamespace(plan=ENVELOPE),
+        graph=SimpleNamespace(nodes=(AiExtract(node_id="extract"),)))
+    execute = worker.prepare_quail_request if prepare else worker.execute_quail_request
+    with pytest.raises(ValueError, match="settings must match"):
+        execute(context)
+
+
+@pytest.mark.parametrize("chain", ["direct", "context", "cause", "group", "cycle"])
+def test_native_query_failure_drops_gpu_references_held_by_traceback(
+        monkeypatch, chain):
+    class Model:
+        pass
+
+    gpu = LoadedGpu.__new__(LoadedGpu)
+    gpu.model = Model()
+    model = weakref.ref(gpu.model)
+    gpu.generation = False
+    gpu.execution = SimpleNamespace(close=lambda: None)
+    gpu.arena = gpu.pipeline = gpu.async_ans = None
+    gpu.prepared_boot = {"kind": "warm", "boot_s": 0}
+    state = {("quail", "qwen3-4b-fp8"): gpu}
+    monkeypatch.setattr(worker, "_gpu_state", lambda gpu: {"model": gpu.model})
+
+    def inner(loaded_model):
+        assert loaded_model is model()
+        raise RuntimeError("query failed")
+
+    def fail(state, *args):
+        saved = None
+        try:
+            inner(state["model"])
+        except RuntimeError as error:
+            if chain == "direct":
+                raise
+            if chain == "context":
+                raise RuntimeError("query failed again")
+            if chain in ("cause", "cycle"):
+                outer = RuntimeError("query failed again")
+                if chain == "cycle":
+                    error.__cause__ = outer
+                raise outer from error
+            saved = error
+        raise ExceptionGroup("query failed group", [saved])
+
+    def release(state):
+        gpu.close()
+        state.clear()
+
+    monkeypatch.setattr(worker, "execute_single", fail)
+    monkeypatch.setattr(worker, "release_booted_models", release)
+    registry = built_in_registry()
+    with pytest.raises(Exception, match="query failed") as caught:
+        worker.execute_quail_payload(
+            PAYLOAD, registry, object(), registry.backend("quail"), state)
+    assert caught.value.__traceback__ is not None
+    if chain == "cycle":
+        assert caught.value.__cause__.__cause__ is caught.value
+    assert not state and gpu.model is None
+    assert model() is None
