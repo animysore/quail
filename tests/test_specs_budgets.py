@@ -53,3 +53,20 @@ def test_arena_pages_needs_room_for_one_chunk_of_sliding_kv():
     small = replace(H100_SXM, mem_bytes=40e9)
     with pytest.raises(ValueError, match="one chunk's sliding KV"):
         budgets.arena_pages(DIFFUSION_GEMMA_26B_FP8, small)
+
+
+@pytest.mark.parametrize("model", [QWEN3_4B_FP8, QWEN3_32B_FP8])
+def test_generation_budgets_full_head_and_serial_scratch(model):
+    chunk = budgets.chunk_budget(model, H100_SXM, generation=True)
+    scratch = budgets.generation_scratch_bytes(model)
+    assert scratch >= 6 * model.vocab + model.act_per_token
+    available = budgets.arena_bytes(model, H100_SXM, chunk, generation=True)
+    assert available == pytest.approx(
+        H100_SXM.mem_bytes * budgets.POOL_FRACTION - model.W_mem - scratch
+        - budgets.ACT_RESERVE_CHUNKS * chunk * model.act_per_token)
+    difference = budgets.arena_bytes(model, H100_SXM, chunk) - available
+    assert difference == pytest.approx(model.head_mem_bytes + scratch)
+    full, sliding = budgets.arena_pages(model, H100_SXM, generation=True)
+    assert sliding == 0 and full > 0
+    assert budgets.arena_tokens(model, H100_SXM, generation=True) == full * 16
+    assert full * 16 * model.kappa <= available < (full + 1) * 16 * model.kappa

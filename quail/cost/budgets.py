@@ -14,6 +14,18 @@ ACT_RESERVE_CHUNKS = 2  # chunks of activation memory reserved outside
 #                         the arena for overlapped chunk construction
 
 
+def generation_scratch_bytes(model: ModelSpec) -> int:
+    """Reserve one logit row, its FP32 copy, a mask, and one decode row."""
+    padded_vocab = -(-model.vocab // 256) * 256
+    return 8 * padded_vocab + 4 * -(-padded_vocab // 32) + int(model.act_per_token)
+
+
+def _resident_bytes(model: ModelSpec, generation: bool) -> float:
+    if generation:
+        return model.W_mem + generation_scratch_bytes(model)
+    return model.W_resident
+
+
 def minimum_weight_gpus(model: ModelSpec, device: DeviceSpec) -> int:
     """Return how many pooled GPU memories would hold the loaded weights.
 
@@ -34,31 +46,33 @@ def kernel_index_cap(model: ModelSpec) -> int:
     return INT32_MAX // model.widest_projection
 
 
-def chunk_memory_bound(model: ModelSpec, device: DeviceSpec) -> int:
+def chunk_memory_bound(model: ModelSpec, device: DeviceSpec, *,
+                       generation=False) -> int:
     """Tokens per chunk the activation memory allows, with slack.
 
-    Uses resident weights after the full untied output head is discarded.
+    Generation reserves the full output head and serial decoding scratch.
     """
-    free = device.mem_bytes * POOL_FRACTION - model.W_resident
+    free = device.mem_bytes * POOL_FRACTION - _resident_bytes(model, generation)
     return int(free // model.act_per_token) // CHUNK_SLACK
 
 
-def chunk_budget(model: ModelSpec, device: DeviceSpec) -> int:
+def chunk_budget(model: ModelSpec, device: DeviceSpec, *, generation=False) -> int:
     """Effective chunk budget, floored at the compute knee.
 
     The budget is min(memory bound, kernel index cap, the spec's own
     cap when it has one) before the floor.
     """
-    b = min(chunk_memory_bound(model, device), kernel_index_cap(model))
+    b = min(chunk_memory_bound(model, device, generation=generation),
+            kernel_index_cap(model))
     if model.chunk_cap_tokens:
         b = min(b, model.chunk_cap_tokens)
     return max(b, int(compute_knee(model, device)))
 
 
 def arena_bytes(model: ModelSpec, device: DeviceSpec,
-                chunk_tokens: int) -> float:
+                chunk_tokens: int, *, generation=False) -> float:
     """Bytes left for KV after resident weights and the activation reserve."""
-    return (device.mem_bytes * POOL_FRACTION - model.W_resident
+    return (device.mem_bytes * POOL_FRACTION - _resident_bytes(model, generation)
             - ACT_RESERVE_CHUNKS * chunk_tokens * model.act_per_token)
 
 
@@ -78,7 +92,8 @@ def transient_sliding_pages(chunk_tokens: int, window: int) -> int:
 
 def arena_pages(model: ModelSpec, device: DeviceSpec,
                 chunk_tokens: int | None = None,
-                mean_doc_tokens: float | None = None) -> tuple[int, int]:
+                mean_doc_tokens: float | None = None, *,
+                generation=False) -> tuple[int, int]:
     """Pages of the two KV pools: (every-token pool, sliding-layer pool).
 
     A model without sliding layers gets one pool and 0 sliding pages.
@@ -91,8 +106,8 @@ def arena_pages(model: ModelSpec, device: DeviceSpec,
     fraction.
     """
     if chunk_tokens is None:
-        chunk_tokens = chunk_budget(model, device)
-    free = arena_bytes(model, device, chunk_tokens)
+        chunk_tokens = chunk_budget(model, device, generation=generation)
+    free = arena_bytes(model, device, chunk_tokens, generation=generation)
     page_bytes_full = model.kappa_full * PAGE_TOKENS
     page_bytes_sliding = model.kappa_sliding * PAGE_TOKENS
     if not page_bytes_sliding:
@@ -114,14 +129,16 @@ def arena_pages(model: ModelSpec, device: DeviceSpec,
 
 def arena_tokens(model: ModelSpec, device: DeviceSpec,
                  chunk_tokens: int | None = None,
-                 mean_doc_tokens: float | None = None) -> int:
+                 mean_doc_tokens: float | None = None, *,
+                 generation=False) -> int:
     """Admission budget: tokens of document KV that can be resident at once.
 
     Computed from the memory left after resident weights and the
     activation reservation. With sliding layers this is the
     every-token pool; see arena_pages.
     """
-    full, _ = arena_pages(model, device, chunk_tokens, mean_doc_tokens)
+    full, _ = arena_pages(model, device, chunk_tokens, mean_doc_tokens,
+                          generation=generation)
     return full * PAGE_TOKENS
 
 

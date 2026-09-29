@@ -5,14 +5,15 @@ gate_up, fp8 weights and block scales laid out for DeepGEMM. No
 engine, no scheduler, no KV pool. vLLM is a library here (loader and
 kernels), nothing more.
 
-After load, only the TRUE/FALSE output rows are retained. The full
-output head is discarded; shared input embeddings remain available.
+After load, TRUE/FALSE output rows are retained for Boolean readout.
+Generation-capable loads also keep the full output head.
 
 get_model reads tensor-parallel group objects. Those collectives are
 no-ops at world size 1, so this path installs single-rank stubs
 instead of starting NCCL or gloo.
 """
 
+import gc
 from functools import lru_cache
 from pathlib import Path
 
@@ -109,21 +110,30 @@ def _install_single_rank_groups(torch):
     ps._NODE_COUNT = 1
 
 
-def retain_answer_head(torch, model, token_ids):
-    """Keep the answer rows and release the full output head."""
+def retain_answer_head(torch, model, token_ids, *, generation=False):
+    """Keep Boolean rows and select whether the full output head is needed."""
     allowed = tuple(sorted(set(token_ids)))
     if not allowed:
         raise ValueError("TRUE/FALSE token ids must not be empty")
     if hasattr(model, "quail_answer_token_ids"):
         answer_weights(model, allowed)
-        return
-    weight = model.lm_head.weight
-    indices = torch.tensor(allowed, device=weight.device, dtype=torch.long)
-    weights = weight.detach().index_select(0, indices).to(dtype=torch.bfloat16)
-    model.register_buffer("quail_answer_weights", weights, persistent=False)
-    model.quail_answer_token_ids = allowed
-    # lm_head can be the same module as embed_tokens; drop only this reference.
-    model.lm_head = None
+    else:
+        weight = model.lm_head.weight
+        indices = torch.tensor(allowed, device=weight.device, dtype=torch.long)
+        weights = weight.detach().index_select(0, indices).to(dtype=torch.bfloat16)
+        del weight
+        model.register_buffer("quail_answer_weights", weights, persistent=False)
+        model.quail_answer_token_ids = allowed
+    if generation and model.lm_head is None:
+        if not model.config.tie_word_embeddings:
+            raise ValueError("Generation requires reloading the untied output head")
+        model.lm_head = model.model.embed_tokens
+    elif not generation:
+        # lm_head can be embed_tokens itself; drop only this reference.
+        model.lm_head = None
+        # vLLM's parameter stores a bound weight_loader that owns the head.
+        gc.collect()
+    model.quail_generation = generation
 
 
 def answer_weights(model, token_ids):
@@ -136,8 +146,8 @@ def answer_weights(model, token_ids):
 
 def load_model(model_name: str, revision: str | None = None, *,
                answer_token_ids=None, max_batched_tokens=None,
-               moe_backend=None):
-    """Load model weights and retain only TRUE/FALSE output rows.
+               moe_backend=None, generation=False):
+    """Load weights, Boolean rows, and optionally the full output head.
 
     max_batched_tokens is the largest chunk the model will see. vLLM's
     fused MoE kernels size their scratch buffers from it; a dense model
@@ -181,7 +191,7 @@ def load_model(model_name: str, revision: str | None = None, *,
         tokenizer = AutoTokenizer.from_pretrained(model_path, local_files_only=True)
         true_ids, false_ids = true_false_ids(tokenizer)
         answer_token_ids = true_ids | false_ids
-    retain_answer_head(torch, model, answer_token_ids)
+    retain_answer_head(torch, model, answer_token_ids, generation=generation)
     torch.cuda.empty_cache()
     torch.cuda.synchronize()
     return model

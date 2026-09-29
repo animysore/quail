@@ -973,7 +973,7 @@ def run_join(torch, arena, pipeline, async_ans, anchor_prefixes,
 # Bump when either pass covers a different set of shapes. A bumped
 # version invalidates every marker, so the next boot re-runs the
 # compile pass and re-commits the cache.
-WARMUP_VERSION = 4
+WARMUP_VERSION = 5
 
 
 def _warm_inputs(budget):
@@ -1080,28 +1080,29 @@ def touch_kernels(torch, arena, pipeline, async_ans, budget):
                   join_chunk=True)
 
 
-def _marker_path(model_name, budget):
+def _marker_path(model_name, budget, generation=False):
     import os
     root = os.path.expanduser(os.environ.get(
         "QUAIL_CACHE_DIR", "~/.cache/quail/kernels"))
     safe = model_name.replace("/", "--")
-    return os.path.join(root, f"quail-warm-{safe}-{int(budget)}.json")
+    mode = "-generation" if generation else ""
+    return os.path.join(root, f"quail-warm-{safe}-{int(budget)}{mode}.json")
 
 
-def _marker_identity(torch, model_name, budget):
+def _marker_identity(torch, model_name, budget, generation=False):
     try:
         import vllm
         vllm_version = vllm.__version__
     except ImportError:
         vllm_version = None
     return dict(warmup_version=WARMUP_VERSION, model=model_name,
-                budget=int(budget), vllm=vllm_version,
+                budget=int(budget), generation=generation, vllm=vllm_version,
                 torch=torch.__version__, cuda=torch.version.cuda,
                 gpu=torch.cuda.get_device_name())
 
 
 def warm_kernels(torch, arena, pipeline, async_ans, budget, *,
-                 model_name, force_compile=False):
+                 model_name, force_compile=False, generation_warmup=None):
     """Compile once under a file lock, then warm each GPU process.
 
     Returns:
@@ -1112,8 +1113,9 @@ def warm_kernels(torch, arena, pipeline, async_ans, budget, *,
     import os
 
     with quiet():
-        path = _marker_path(model_name, budget)
-        identity = _marker_identity(torch, model_name, budget)
+        generation = generation_warmup is not None
+        path = _marker_path(model_name, budget, generation)
+        identity = _marker_identity(torch, model_name, budget, generation)
         os.makedirs(os.path.dirname(path), exist_ok=True)
         t0 = time.perf_counter()
         tier = "touch"
@@ -1135,6 +1137,8 @@ def warm_kernels(torch, arena, pipeline, async_ans, budget, *,
             if force_compile or on_disk != identity:
                 logger.info("kernels: starting compile pass")
                 compile_kernels(torch, arena, pipeline, async_ans, budget)
+                if generation_warmup is not None:
+                    generation_warmup()
                 torch.cuda.synchronize()
                 tmp = path + ".tmp"
                 with open(tmp, "w") as f:
@@ -1144,6 +1148,8 @@ def warm_kernels(torch, arena, pipeline, async_ans, budget, *,
         if tier == "touch":
             logger.info("kernels: warming cached filter and join kernels")
             touch_kernels(torch, arena, pipeline, async_ans, budget)
+            if generation_warmup is not None:
+                generation_warmup()
         torch.cuda.synchronize()
         warm_s = round(time.perf_counter() - t0 - wait_s, 2)
         wait_s = round(wait_s, 2)

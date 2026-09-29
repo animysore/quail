@@ -21,6 +21,7 @@ def torch():
 
 def _model(torch, tied=False):
     model = torch.nn.Module()
+    model.config = SimpleNamespace(tie_word_embeddings=tied)
     model.model = torch.nn.Module()
     model.model.embed_tokens = torch.nn.Embedding(8, 4, dtype=torch.bfloat16)
     model.lm_head = (model.model.embed_tokens if tied else
@@ -79,6 +80,45 @@ def test_retained_answer_weights_ownership_and_answer_rows(torch):
     assert first(hidden) == second(hidden) == expected
     assert AsyncAnswers.dtype is None
     assert AsyncScores.dtype is np.float32
+
+
+@pytest.mark.parametrize("tied", [False, True])
+def test_generation_retains_full_head_and_boolean_rows(torch, tied):
+    loaded = _model(torch, tied)
+    head = loaded.lm_head
+    expected = head.weight.detach()[[1, 3, 5]].clone()
+    retain_answer_head(torch, loaded, [1, 3, 5], generation=True)
+    assert loaded.lm_head is head
+    assert loaded.quail_generation
+    assert torch.equal(answer_weights(loaded, [1, 3, 5]), expected)
+    if tied:
+        assert loaded.lm_head.weight is loaded.model.embed_tokens.weight
+    retain_answer_head(torch, loaded, [1, 3, 5])
+    assert loaded.lm_head is None and not loaded.quail_generation
+    if tied:
+        retain_answer_head(torch, loaded, [1, 3, 5], generation=True)
+        assert loaded.lm_head is head
+        assert torch.equal(answer_weights(loaded, [1, 3, 5]), expected)
+    else:
+        with pytest.raises(ValueError, match="reloading"):
+            retain_answer_head(torch, loaded, [1, 3, 5], generation=True)
+        assert loaded.lm_head is None and not loaded.quail_generation
+
+
+def test_discarded_head_collects_vllm_weight_loader_cycle(torch):
+    enabled = gc.isenabled()
+    gc.disable()
+    try:
+        loaded = _model(torch)
+        loaded.lm_head.weight.weight_loader = loaded.lm_head.forward
+        head, weight = weakref.ref(loaded.lm_head), weakref.ref(loaded.lm_head.weight)
+        retain_answer_head(torch, loaded, [1, 3, 5])
+        assert loaded.lm_head is None
+        assert head() is None and weight() is None
+        assert loaded.quail_answer_weights.shape == (3, 4)
+    finally:
+        if enabled:
+            gc.enable()
 
 
 def test_run_join_evicts_then_halves_a_chunk_that_does_not_fit(monkeypatch):

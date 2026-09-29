@@ -12,7 +12,11 @@ from quail.backends.base import GpuContext
 from quail.backends.quail.distributed import execute_distributed_graph
 from quail.backends.quail.executor.arena import KVArena
 from quail.backends.quail.executor.loop import warm_kernels
-from quail.backends.quail.executor.model import load_model, resolve_model_path
+from quail.backends.quail.executor.model import (
+    load_model,
+    resolve_model_path,
+    retain_answer_head,
+)
 from quail.backends.quail.executor.models import build_pipeline
 from quail.backends.quail.executor.readout import AnswerRows, AsyncAnswers
 from quail.backends.quail.graph import (
@@ -43,6 +47,15 @@ from quail.progress import say, set_gpu_index
 _CHILDREN: list = []
 
 
+def _generation_requested(context):
+    generation = bool(context.query_settings.get("generation", False))
+    spec = context.model
+    if generation and (spec.arch != "qwen3" or spec.role != "generative"
+                       or context.gpu_count != 1):
+        raise ValueError("Native generation requires generative Qwen3 on one GPU")
+    return generation
+
+
 class LoadedGpu:
     """One model loaded on one GPU, reusable across queries."""
 
@@ -56,6 +69,7 @@ class LoadedGpu:
         self.torch = torch
         self.F = F
         self.spec = spec
+        self.generation = _generation_requested(context)
         self._warmed = False
         self.prepared_boot = None
 
@@ -64,13 +78,14 @@ class LoadedGpu:
         say(f"loading {spec.hf_name} onto GPU {gpu_index}, "
             f"{free / 2**30:.1f} of {total / 2**30:.1f} GiB free")
 
-        budget = budgets.chunk_budget(spec, device)
+        budget = budgets.chunk_budget(spec, device, generation=self.generation)
         t0 = time.perf_counter()
         self.model = load_model(model_path or spec.hf_name,
                                 revision=None if model_path else spec.revision,
                                 answer_token_ids=answer_token_ids,
                                 max_batched_tokens=budget,
-                                moe_backend=spec.moe_backend)
+                                moe_backend=spec.moe_backend,
+                                generation=self.generation)
         self.load_model_s = time.perf_counter() - t0
 
         # cuBLAS allocates its handle outside PyTorch's caching allocator.
@@ -82,7 +97,8 @@ class LoadedGpu:
         torch.cuda.synchronize()
 
         t0 = time.perf_counter()
-        full_pages, sliding_pages = budgets.arena_pages(spec, device, budget)
+        full_pages, sliding_pages = budgets.arena_pages(
+            spec, device, budget, generation=self.generation)
         self.arena = KVArena(n_layers=spec.layers,
                              n_pages=full_pages,
                              page_tokens=budgets.PAGE_TOKENS,
@@ -104,6 +120,20 @@ class LoadedGpu:
 
         self.async_ans = None
         self.chunk_tokens = None
+
+    def bind_generation(self, generation):
+        """Switch a tied head's capability without copying its embedding."""
+        if generation == self.generation:
+            return
+        if not self.spec.tied_head:
+            raise ValueError("Changing an untied head's mode requires a reload")
+        retain_answer_head(
+            self.torch, self.model, self.model.quail_answer_token_ids,
+            generation=generation)
+        self.generation = generation
+        self.prepared_boot = None
+        if generation:
+            self._warmed = False
 
     def bind_query(self, true_ids, false_ids, chunk_tokens, arena_pages=None):
         """Attach the answer rows, readout, and chunk budget for one query.
@@ -132,10 +162,18 @@ class LoadedGpu:
         if self._warmed:
             return 0.0, None
         t0 = time.perf_counter()
+        generation_warmup = None
+        if self.generation:
+            from quail.backends.quail.executor.generate import warm_generation
+
+            def generation_warmup():
+                warm_generation(self.torch, self.model, self.arena, self.pipeline)
+
         with self.torch.inference_mode():
             warm = warm_kernels(self.torch, self.arena, self.pipeline,
                                 self.async_ans, self.chunk_tokens,
-                                model_name=self.spec.hf_name)
+                                model_name=self.spec.hf_name,
+                                generation_warmup=generation_warmup)
         self.torch.cuda.synchronize()
         warm_s = time.perf_counter() - t0
         self._warmed = True
@@ -143,9 +181,14 @@ class LoadedGpu:
 
     def close(self):
         """Release GPU resources held by the execution context."""
-        close_fn = getattr(self.execution, "close", None)
-        if callable(close_fn):
-            close_fn()
+        try:
+            close_fn = getattr(self.execution, "close", None)
+            if callable(close_fn):
+                close_fn()
+        finally:
+            self.model = self.pipeline = self.arena = self.async_ans = None
+            self.execution = None
+            self.prepared_boot = None
 
 
 def _boot_record(gpu, cold, warm_s, warm_tier, t_boot):
@@ -189,7 +232,7 @@ def _single_gpu_context(registry, envelope):
         gpu_count=envelope["workers"],
         model=registry.model(envelope["model"]),
         device=registry.device(envelope["device"]),
-        query_settings={},
+        query_settings=dict(envelope["settings"]),
     )
 
 
@@ -198,24 +241,39 @@ def _boot_for_query(runtime_state, backend, gpu_context,
     """Load or reuse a GPU, bind a query, warm kernels."""
     from quail.backends.request import release_request_engines
 
+    generation = _generation_requested(gpu_context)
     release_request_engines(runtime_state)
     key = (backend.name, gpu_context.model.name)
     gpu = runtime_state.get(key)
     t_boot = time.perf_counter()
-    if gpu is None:
-        loaded = [name for _, name in runtime_state if name != key[1]]
-        if loaded:
-            # one model's weights and KV arena take the GPU; another
-            # model cannot load beside them
-            say(f"releasing {', '.join(loaded)} to load {key[1]}")
+    try:
+        if gpu is not None and gpu.generation != generation:
+            if gpu_context.model.tied_head:
+                gpu.bind_generation(generation)
+            else:
+                gpu = None
+                release_booted_models(runtime_state)
+        if gpu is None:
+            loaded = [name for _, name in runtime_state if name != key[1]]
+            if loaded:
+                # One model and arena must be released before another can load.
+                say(f"releasing {', '.join(loaded)} to load {key[1]}")
+                release_booted_models(runtime_state)
+            gpu = LoadedGpu(backend, gpu_context, true_ids + false_ids)
+            runtime_state[key] = gpu
+            cold = True
+        else:
+            cold = False
+        gpu.bind_query(true_ids, false_ids, chunk_tokens, arena_pages)
+        warm_s, warm_tier = gpu.warm()
+    except Exception as error:
+        gpu = None
+        try:
             release_booted_models(runtime_state)
-        gpu = LoadedGpu(backend, gpu_context, true_ids + false_ids)
-        runtime_state[key] = gpu
-        cold = True
-    else:
-        cold = False
-    gpu.bind_query(true_ids, false_ids, chunk_tokens, arena_pages)
-    warm_s, warm_tier = gpu.warm()
+        except Exception as cleanup_error:
+            error.add_note(f"Native cleanup also failed: {cleanup_error}")
+            runtime_state.clear()
+        raise
     boot = _boot_record(gpu, cold, warm_s, warm_tier, t_boot)
     say(f"model ready, boot {boot['boot_s']} s ({boot['kind']})")
     return gpu, boot
@@ -303,7 +361,9 @@ def execute_quail_payload(payload, registry, graph, backend, runtime_state):
     gpu = runtime_state.get(key)
     boot = None
     if isinstance(gpu, LoadedGpu):
-        boot = gpu.prepared_boot
+        generation = bool(gpu_context.query_settings.get("generation", False))
+        if gpu.generation == generation:
+            boot = gpu.prepared_boot
         gpu.prepared_boot = None
     if boot is None:
         gpu, boot = _boot_for_query(

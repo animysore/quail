@@ -3,7 +3,8 @@ title: Extraction design
 description: Proposed native Qwen3 decoding and a shared extraction contract.
 ---
 
-This is a proposal for native extraction, which is not implemented yet.
+Native full-head loading and a serial decoder are implemented as executor
+primitives. Native SQL extraction is not connected to them yet.
 The SQL surface and shared extraction operator run through `dumb_vllm`,
 `stock_vllm`, and `pipelined_vllm`.
 The first native version targets generative Qwen3 4B and 32B on one GPU.
@@ -116,9 +117,10 @@ reuses KV within every generated response.
 
 ## Output weights and model lifetime
 
-The native loader currently copies TRUE/FALSE output rows and drops `lm_head`.
-Extraction needs the full output projection. Add an explicit load capability,
-while keeping the small Boolean readout for filters in a mixed query.
+The native loader keeps TRUE/FALSE output rows for Boolean readout. Its
+`generation` capability also retains `lm_head` for full-vocabulary projection.
+Filter-only loads keep the existing reduced-head behavior. The native SQL
+integration must determine this capability from the entire query before boot.
 
 Qwen3 4B ties its output head to the input embeddings. Retain that shared
 reference without cloning a second vocabulary matrix. Qwen3 32B has an untied

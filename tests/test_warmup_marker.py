@@ -2,6 +2,7 @@
 
 import json
 import multiprocessing as mp
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
@@ -93,3 +94,30 @@ def test_warmup_failure_writes_no_marker_and_touch_warms_the_join_chunk(
                         lambda *args, **kwargs: calls.append(kwargs))
     loop.touch_kernels(None, None, None, None, 100)
     assert calls == [{"join_chunk": True}]
+
+
+def test_generation_has_distinct_marker_and_warms_before_publication(
+        monkeypatch, tmp_path):
+    monkeypatch.setenv("QUAIL_CACHE_DIR", str(tmp_path))
+    assert loop._marker_path("model", 100, True) != loop._marker_path("model", 100)
+    monkeypatch.setattr(loop, "compile_kernels", lambda *a: None)
+    monkeypatch.setattr(loop, "touch_kernels", lambda *a: None)
+    events = []
+    generation_path = loop._marker_path("model", 100, True)
+
+    def fail():
+        raise RuntimeError("generation warm-up failed")
+
+    with pytest.raises(RuntimeError, match="generation warm-up"):
+        loop.warm_kernels(
+            _stub_torch(), None, None, None, 100, model_name="model",
+            generation_warmup=fail)
+    assert not Path(generation_path).exists()
+    for tier in ("compile", "touch"):
+        result = loop.warm_kernels(
+            _stub_torch(), None, None, None, 100, model_name="model",
+            generation_warmup=lambda: events.append("generation"))
+        assert result["tier"] == tier
+    assert events == ["generation", "generation"]
+    marker = json.loads(Path(generation_path).read_text())
+    assert marker["generation"] is True
