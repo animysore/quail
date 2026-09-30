@@ -8,6 +8,7 @@ from quail.bench.quailb import (
     _submission_to_answer_s,
     queries,
     register_tables,
+    unsupported_queries,
 )
 from quail.planner.plan import EngineConfig, Refusal
 from quail_b.data import ASPECTS, SCENARIOS
@@ -62,7 +63,8 @@ def test_all_queries_compile_and_plan_and_answer_timing_adds_common_work(tmp_pat
         "AGENT-1", "AGENT-2",
         "PRIV-1", "PRIV-2",
     }
-    assert set(QUERY_ORDER) == expected - {"PRIV-1", "PRIV-2"}
+    assert set(QUERY_ORDER) - unsupported_queries(QUERY_ORDER).keys() == (
+        expected - {"PRIV-1", "PRIV-2"})
     for backend in ("quail", "stock_vllm", "pipelined_vllm", "pipelined_sglang"):
         with quail.Session(
             EngineConfig(gpus=1, model="qwen3-4b-fp8", backend=backend,

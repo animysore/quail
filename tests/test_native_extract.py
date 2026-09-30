@@ -22,7 +22,7 @@ from quail.planner.plan import Refusal
 def native(monkeypatch):
     control = SimpleNamespace(
         calls=[], replies={}, generators=[], loads=[], filters=[], released=[],
-        state={}, fail=False, sessions=[])
+        state={}, fail=False, sessions=[], keep=lambda prompt: "KEEP" in prompt)
 
     class Generator(ExtractClient):
         def __init__(self, torch, model, arena, pipeline, spec, chunk_tokens):
@@ -84,7 +84,7 @@ def native(monkeypatch):
         results, fresh = {}, 0
         for index, prefix in enumerate(documents):
             record["prefixes"].append(list(prefix))
-            keep = "KEEP" in bytes(int(t) - 1 for t in prefix).decode()
+            keep = control.keep(bytes(int(t) - 1 for t in prefix).decode())
             row = [keep] * (len(questions) if keep else 1)
             results[index] = row
             fresh += len(prefix) + sum(map(len, questions[:len(row)]))

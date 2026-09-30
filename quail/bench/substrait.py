@@ -4,7 +4,8 @@ A QUAIL-B query is a Substrait plan (a protocol buffer that describes
 a relational query): `ReadRel` scans, `FilterRel` calls to
 `ai_filter`, inner `JoinRel` calls to `ai_join` (joined with ordinary
 `equal` conditions by `and`), and a `ProjectRel` under the root that
-selects the id column of each relation. The alias of a relation and
+selects IDs or extraction results. Inner projects call `ai_extract`.
+The alias of a relation and
 the id of an operator are the `RelCommon.hint.alias` of its node.
 Operator ids number filters and joins in post-order, inputs before the
 operator and left before right.
@@ -14,6 +15,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
+from sqlglot import exp
 from substrait import algebra_pb2, plan_pb2
 
 import quail
@@ -21,8 +23,14 @@ import quail
 AI_URN = "extension:org.fsdatalab.quail_b:functions_ai"
 AI_FILTER = "ai_filter:str_str"
 AI_JOIN = "ai_join:str_str_str"
+AI_EXTRACT = "ai_extract:str_list_any"
+AI_CLASSIFY = "ai_classify:str_str_list_list"
 EQUAL = "equal:any_any"
 AND = "and:bool"
+
+
+class UnsupportedQueryError(ValueError):
+    """A valid benchmark query uses an operator Quail does not implement."""
 
 
 @dataclass(frozen=True)
@@ -64,17 +72,28 @@ class Join:
 
 
 @dataclass(frozen=True)
+class Extract:
+    """One extraction projection over a document column."""
+
+    id: str
+    alias: str
+    column: str
+    fields: tuple[str, ...]
+    output: str
+
+
+@dataclass(frozen=True)
 class QueryPlan:
     """A QUAIL-B query as its relations, operators, and projection.
 
     Attributes:
         relations: The scanned relations, in scan order.
-        operators: The filters and joins, in operator id order.
+        operators: The filters, joins and extracts, in operator id order.
         select: The projected columns, as "alias.column".
     """
 
     relations: tuple[Relation, ...]
-    operators: tuple[Filter | Join, ...]
+    operators: tuple[Filter | Join | Extract, ...]
     select: tuple[str, ...]
 
     @property
@@ -84,6 +103,10 @@ class QueryPlan:
     @property
     def joins(self) -> tuple[Join, ...]:
         return tuple(op for op in self.operators if isinstance(op, Join))
+
+    @property
+    def extracts(self) -> tuple[Extract, ...]:
+        return tuple(op for op in self.operators if isinstance(op, Extract))
 
     def filter_id(self, alias: str, position: int) -> str:
         """Return the id of an alias's filter at a written position."""
@@ -102,7 +125,7 @@ def _functions(plan: plan_pb2.Plan) -> dict[int, str]:
         if not declaration.HasField("extension_function"):
             continue
         function = declaration.extension_function
-        if function.name in (AI_FILTER, AI_JOIN) and (
+        if function.name in (AI_FILTER, AI_JOIN, AI_EXTRACT, AI_CLASSIFY) and (
                 urns.get(function.extension_urn_reference) != AI_URN):
             raise ValueError(f"{function.name} must come from {AI_URN}")
         names[function.function_anchor] = function.name
@@ -146,6 +169,17 @@ def _conditions(expression, functions) -> list[tuple[str, list]]:
             for item in _conditions(argument, functions)]
 
 
+def _field_names(fields, operators):
+    extracts = {(op.alias, op.output): op.fields for op in operators
+                if isinstance(op, Extract)}
+    names = []
+    for alias, name in fields:
+        names.append(f"{alias}.{name}")
+        if (alias, name) in extracts:
+            names.extend(("response", *extracts[alias, name], "error"))
+    return names
+
+
 def _read(rel: algebra_pb2.Rel, functions):
     """Return (relations, operators, fields) of one relation subtree."""
     kind = rel.WhichOneof("rel_type")
@@ -156,6 +190,22 @@ def _read(rel: algebra_pb2.Rel, functions):
             raise ValueError("a scan needs a table name and an alias hint")
         fields = tuple((alias, name) for name in read.base_schema.names)
         return [Relation(alias, read.named_table.names[-1])], [], fields
+    if kind == "project":
+        project = rel.project
+        name, arguments = _call(project.expressions[0], functions)
+        if name == AI_CLASSIFY:
+            raise UnsupportedQueryError("AI.CLASSIFY is not implemented in Quail")
+        if name != AI_EXTRACT:
+            raise ValueError("unsupported benchmark projection")
+        relations, operators, fields = _read(project.input, functions)
+        alias, column = _field(fields, arguments[0])
+        extracted_fields = tuple(
+            value.string for value in arguments[1].literal.list.values)
+        offset = len(_field_names(fields, operators))
+        output = project.common.hint.output_names[offset].split(".", 1)[1]
+        operators.append(Extract(
+            project.common.hint.alias, alias, column, extracted_fields, output))
+        return relations, operators, (*fields, (alias, output))
     if kind == "filter":
         relations, operators, fields = _read(rel.filter.input, functions)
         name, arguments = _call(rel.filter.condition, functions)
@@ -209,6 +259,11 @@ def read_plan(plan: plan_pb2.Plan) -> QueryPlan:
     if not root.input.HasField("project"):
         raise ValueError("a QUAIL-B plan projects its output under the root")
     functions = _functions(plan)
+    if AI_EXTRACT in functions.values():
+        from quail_b.queries import QuerySpec
+
+        # Validate dependent types and nested names before translating the call.
+        QuerySpec.from_plan("quail-adapter", "", plan)
     relations, operators, fields = _read(root.input.project.input, functions)
     select = tuple(".".join(_field(fields, expression))
                    for expression in root.input.project.expressions)
@@ -227,6 +282,8 @@ def build_query(session, plan: QueryPlan, selectivity=None,
         order: The filter order rule `select` takes.
     """
     selectivity = selectivity or {}
+    if plan.extracts:
+        return _build_extract_query(session, plan, selectivity, order)
     by_alias = {relation.alias: relation for relation in plan.relations}
     filters = {}
     for item in plan.filters:
@@ -256,3 +313,38 @@ def build_query(session, plan: QueryPlan, selectivity=None,
             selectivity=selectivity.get(join.prompt))
         joined.add(new[0])
     return query.select(*plan.select, order=order)
+
+
+def _build_extract_query(session, plan, selectivity, order):
+    """Build extraction through the supported SQL frontend."""
+    relation, = plan.relations
+    extracts = {op.output: op for op in plan.extracts}
+    selected = []
+    for name in plan.select:
+        alias, column = name.split(".", 1)
+        if column == "id":
+            selected.append(exp.column(column, table=alias, quoted=True))
+        else:
+            operator = extracts[column]
+            call = exp.Anonymous(this="AI_EXTRACT", expressions=[
+                exp.column(operator.column, table=alias, quoted=True),
+                *(exp.Literal.string(field) for field in operator.fields)])
+            selected.append(exp.alias_(call, operator.output, quoted=True))
+    tree = exp.select(*selected).from_(exp.Table(
+        this=exp.to_identifier(relation.table, quoted=True),
+        alias=exp.TableAlias(
+            this=exp.to_identifier(relation.alias, quoted=True))))
+    conditions = []
+    for predicate in plan.filters:
+        arguments = [exp.Anonymous(this="PROMPT", expressions=[
+            exp.Literal.string(predicate.prompt),
+            exp.column(predicate.column, table=predicate.alias, quoted=True)])]
+        estimate = selectivity.get(predicate.prompt)
+        if estimate is not None:
+            arguments.append(exp.Struct(expressions=[exp.PropertyEQ(
+                this=exp.Literal.string("selectivity"),
+                expression=exp.Literal.number(estimate))]))
+        conditions.append(exp.Anonymous(this="AI_FILTER", expressions=arguments))
+    if conditions:
+        tree = tree.where(*conditions)
+    return session.sql(tree.sql(dialect="snowflake"), order=order)

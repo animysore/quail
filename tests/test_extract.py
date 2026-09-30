@@ -57,6 +57,7 @@ class ExtractClient:
         self.filter_prompts = []
         self.replies = {}
         self.closed = False
+        self.filter_answer = lambda prompt: "KEEP" in prompt
 
     def reset_prefix_cache(self):
         return True
@@ -70,7 +71,7 @@ class ExtractClient:
         for prompt in prompts:
             output = _output("", prompt_tokens=len(_tokens(prompt)))
             output.outputs[0].token_ids = _tokens(
-                "TRUE" if "KEEP" in prompt else "FALSE"
+                "TRUE" if self.filter_answer(prompt) else "FALSE"
             )[:1]
             outputs.append(output)
         return outputs

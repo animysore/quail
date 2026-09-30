@@ -39,9 +39,58 @@ uv run modal run --detach -m quail.bench.quailb_parallel \
   2>&1 | tee results/benchmark/quailb.log
 ```
 
-Omit `--only` / `--query` to run all queries. Add `--no-include-baselines`
+Omit `--only` / `--query` to run the supported published queries.
+The benchmark dependency also contains classification queries. Quail does not
+implement `AI.CLASSIFY`; the runner omits these queries and records them under
+`skipped_queries`. Add `--no-include-baselines`
 to run Quail alone on Modal. Modal results are saved to the
 `quail-results` volume under `/results/benchmarks/quailb/<run-id>/`.
+
+## Extraction samples
+
+The fork's benchmark dependency bundles three opt-in synthetic queries:
+`EXTRACT-1` extracts invoice vendor and total, `EXTRACT-2` filters invoices
+before extracting those fields, and `EXTRACT-3` extracts movie title and rating.
+The inputs include missing information and NULL documents. They use fixed,
+hand-authored references and need no downloads.
+
+On one supported GPU:
+
+```bash
+uv run python -m quail.bench.quailb --sf 1.0 \
+  --only EXTRACT-1,EXTRACT-2,EXTRACT-3 \
+  --model qwen3-4b-fp8 --device h100-sxm --backend quail \
+  --output-dir results/quailb/extraction-quail
+```
+
+Use this direct GPU runner for extraction; the Modal family runner currently
+accepts published queries only.
+The same command supports `qwen3-32b-fp8` and the `dumb_vllm`, `stock_vllm`
+and `pipelined_vllm` backends. Use a new output directory for each run.
+Keep these samples separate from published queries; only scale factor 1.0
+is valid. They check correctness on small inputs and do not establish a
+performance improvement.
+
+Extraction query time sums the filter and extraction model nodes. It excludes
+startup, frontend preparation, final projection, collection and scoring.
+The published filter/join runner keeps its existing submission-to-answer
+timing boundary. Reports save the boundary and startup timings.
+Requested input tokens count complete prompts, including repeated prefixes;
+generated output tokens are reported separately. Minimum-prefix and KV regret
+metrics are unavailable for extraction.
+Native filters tokenize document and question pieces separately; vLLM tokenizes
+the full text. Identical text can therefore have different actual token counts.
+For EXTRACT-2 this is 763 requested input tokens for native Quail and 756 for
+vLLM. Extraction prompt tokenization is the same.
+
+The standalone CLI releases cached engines when it finishes or fails.
+Library `run_suite` calls retain compatible models in the worker process.
+
+Results preserve corpus IDs and typed response/error structs. Reports compare
+exact field strings and NULLs, track missing rows and generation errors, and
+save both field agreement and final-row precision/recall. The fixture value
+`GBP 70` deliberately differs from `GBP 70.`; punctuation is not normalized.
+GPU cost uses the reported reference hourly rate, not account billing.
 
 ## Generate a report
 

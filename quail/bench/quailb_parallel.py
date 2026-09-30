@@ -242,6 +242,24 @@ def _query_groups(query_ids) -> list[tuple[str, tuple[str, ...], str]]:
     return groups
 
 
+def _selected_queries(query, sf):
+    """Select supported published queries before scheduling Modal work."""
+    from quail.bench.quailb import unsupported_queries
+    from quail_b import select_queries
+
+    only = [item.strip() for item in query.split(",")] if query else None
+    specs = select_queries(only, scale_factor=sf)
+    if any(spec._info.extracts for spec in specs):
+        raise ValueError(
+            "run extraction samples through python -m quail.bench.quailb")
+    requested = tuple(spec.id for spec in specs)
+    skipped = unsupported_queries(requested)
+    selected = tuple(name for name in requested if name not in skipped)
+    if not selected:
+        raise ValueError(f"no supported benchmark queries remain: {skipped}")
+    return requested, selected, skipped
+
+
 @app.function(image=image, timeout=43200, memory=4096, volumes=VOLUMES)
 def run_all(
     run_dir: str,
@@ -255,10 +273,7 @@ def run_all(
     include_dumb_vllm: bool = False,
     baselines: str = "stock_vllm,pipelined_vllm",
 ):
-    from quail_b import select_queries
-
-    only = [item.strip() for item in query.split(",")] if query else None
-    query_ids = tuple(spec.id for spec in select_queries(only, scale_factor=sf))
+    requested, query_ids, skipped = _selected_queries(query, sf)
     # not resolve(): /results is a mount inside the container
     directory = Path(run_dir)
     if not directory.is_relative_to("/results") or directory == Path("/results"):
@@ -272,6 +287,8 @@ def run_all(
         "model": model,
         "sf": sf,
         "query_ids": list(query_ids),
+        "requested_query_ids": list(requested),
+        "skipped_queries": skipped,
         "summaries": {},
         "function_call_ids": {},
     }
@@ -375,6 +392,8 @@ def _finish_run(directory, manifest, family_calls, sglang_calls, query_ids,
             query_ids, directory.name, started, elapsed, call_ids,
             tuple(item for group in parts[0]["process_groups"]
                   for item in group))
+        reports[method]["skipped_queries"].update(
+            manifest.get("skipped_queries", {}))
         paths[method] = f"{method}/run.json"
 
     from quail_b import report as write_report

@@ -25,7 +25,7 @@ import quail
 import quail_b as benchmark
 from quail.bench import substrait
 from quail.bench.results import write_json
-from quail.bench.substrait import QueryPlan, read_plan
+from quail.bench.substrait import QueryPlan, UnsupportedQueryError, read_plan
 from quail.planner.plan import Refusal
 from quail.specs import H100_USD_PER_HOUR, MODELS
 from quail_b.queries import (
@@ -73,7 +73,10 @@ def queries(session) -> dict:
     """
     listed = {}
     for spec in query_specs(include_privacy=True).values():
-        plan = read_plan(spec.plan)
+        try:
+            plan = read_plan(spec.plan)
+        except UnsupportedQueryError:
+            continue
         if all(relation.table in session.catalog for relation in plan.relations):
             listed[spec.id] = (
                 spec.description, lambda plan=plan: _build(session, plan))
@@ -85,6 +88,8 @@ def canonical_templates(ground_truth) -> dict[str, str]:
     canonical = {}
     for labels in ground_truth.predicates.values():
         predicate = labels.predicate
+        if predicate["kind"] not in {"filter", "join"}:
+            continue
         left = quail.ColumnRef(
             "left", predicate["left_table"], predicate["left_column"])
         if predicate["kind"] == "filter":
@@ -142,16 +147,21 @@ def run_output(result, plan: QueryPlan, tables) -> RunOutput:
     aliases = []
     for name in plan.select:
         alias, column = name.split(".", 1)
-        if column != "id":
+        if column != "id" and column not in {
+                operator.output for operator in plan.extracts}:
             raise NotImplementedError(
-                "QUAIL-B output accuracy needs id columns in the select list")
-        aliases.append(alias)
+                "QUAIL-B output needs id or extraction columns")
+        aliases.append(alias if column == "id" else column)
     started = time.perf_counter()
     rows = result.collect()
     collection_s = time.perf_counter() - started
+    rows = rows.rename_columns(aliases)
     return RunOutput(
-        filter_answers, join_answers, rows.rename_columns(aliases),
-        result.report["wall_s"], dict(result.report, collection_s=collection_s))
+        filter_answers, join_answers, rows,
+        result.report["wall_s"], dict(result.report, collection_s=collection_s),
+        extract_answers={
+            op.id: rows.select([op.alias, op.output]) for op in plan.extracts
+        } if plan.extracts else None)
 
 
 def join_anchors(result) -> dict:
@@ -233,6 +243,22 @@ def run_query(session, spec: QuerySpec, tables) -> RunOutput:
     answer_started = time.perf_counter()
     output = run_output(result, plan, tables)
     answer_prepare_s = time.perf_counter() - answer_started
+    if plan.extracts:
+        nodes = [
+            metrics for name, metrics in result.report["node_metrics"].items()
+            if name == "request-model" or name.startswith(("extract:", "ai_filter:"))
+        ]
+        if not nodes:
+            raise ValueError("extraction benchmark needs model node timings")
+        output.runtime_s = sum(node["wall_s"] for node in nodes)
+        backend = result.report["backend_metrics"]
+        output.measurements.update(
+            wall_s=output.runtime_s,
+            input_tokens=backend["prompt_tokens"],
+            output_tokens=backend["output_tokens"],
+            timing_boundary="filter and extraction model nodes; startup excluded",
+        )
+        return output
     runtime_s = _submission_to_answer_s(
         session.config.backend,
         result.report,
@@ -273,6 +299,17 @@ def refused_queries(session, query_ids, data_dir) -> dict[str, str]:
     return refused
 
 
+def unsupported_queries(query_ids) -> dict[str, str]:
+    """Return unsupported benchmark operators before input or model loading."""
+    skipped = {}
+    for query_id in query_ids:
+        try:
+            read_plan(benchmark.get_query(query_id).plan)
+        except UnsupportedQueryError as error:
+            skipped[query_id] = str(error)
+    return skipped
+
+
 def run_suite(only=None, *, sf=0.1, config, data_dir=None,
               ground_truth_collection=None, output_dir,
               h100_usd_per_hour=H100_USD_PER_HOUR, root=None):
@@ -281,11 +318,16 @@ def run_suite(only=None, *, sf=0.1, config, data_dir=None,
     Queries the backend refuses to plan are left out of the run and
     listed under `skipped_queries` in the returned record.
     """
-    skipped = {}
+    only = list(query_specs()) if only is None else (
+        [only] if isinstance(only, str) else list(only))
+    skipped = unsupported_queries(only)
+    only = [query_id for query_id in only if query_id not in skipped]
     if only and data_dir is not None:
         with quail.Session(config) as preflight_session:
-            skipped = refused_queries(preflight_session, only, data_dir)
+            skipped.update(refused_queries(preflight_session, only, data_dir))
         only = [query_id for query_id in only if query_id not in skipped]
+    if not only:
+        raise ValueError(f"no supported benchmark queries remain: {skipped}")
     with quail.Session(config) as session:
         record = benchmark.run(
             partial(run_query, session), queries=only, scale_factor=sf,
@@ -300,7 +342,10 @@ def run_suite(only=None, *, sf=0.1, config, data_dir=None,
                     "tokenizer, engine, and kernel startup excluded"
                 ),
                 "timing_boundary": (
-                    "raw document tables and query submission to answer"
+                    "filter and extraction model nodes; startup excluded"
+                    if any(read_plan(benchmark.get_query(name).plan).extracts
+                           for name in only)
+                    else "raw document tables and query submission to answer"
                     if config.backend == "quail"
                     else "prompt text submission to answer"
                 ),
@@ -314,7 +359,20 @@ def run_suite(only=None, *, sf=0.1, config, data_dir=None,
         record["skipped_queries"] = skipped
         write_json(Path(output_dir) / "run.json", record)
         benchmark.report(output_dir, rescore=False)
-        return record
+    return record
+
+
+def _close_process_engines():
+    """Release cached engines when the standalone CLI finishes."""
+    from quail.backends.quail.worker import release_booted_models
+    from quail.backends.request import release_request_engines
+    from quail.execution.execute import _BACKEND_STATE
+
+    try:
+        release_request_engines(_BACKEND_STATE)
+    finally:
+        if _BACKEND_STATE:
+            release_booted_models(_BACKEND_STATE)
 
 
 def main():
@@ -329,18 +387,21 @@ def main():
     parser.add_argument("--ground-truth-collection")
     parser.add_argument("--output-dir", required=True, help="new run directory")
     args = parser.parse_args()
-    run_suite(
-        [value.strip() for value in args.only.split(",")] if args.only else None,
-        sf=args.sf,
-        config=quail.EngineConfig(
-            gpus=args.gpus,
-            model=args.model,
-            backend=args.backend,
-            device=args.device,
-        ),
-        data_dir=args.data_dir,
-        ground_truth_collection=args.ground_truth_collection,
-        output_dir=args.output_dir)
+    try:
+        run_suite(
+            [value.strip() for value in args.only.split(",")] if args.only else None,
+            sf=args.sf,
+            config=quail.EngineConfig(
+                gpus=args.gpus,
+                model=args.model,
+                backend=args.backend,
+                device=args.device,
+            ),
+            data_dir=args.data_dir,
+            ground_truth_collection=args.ground_truth_collection,
+            output_dir=args.output_dir)
+    finally:
+        _close_process_engines()
     print(f"saved {args.output_dir}")
 
 

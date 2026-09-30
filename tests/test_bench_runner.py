@@ -13,7 +13,14 @@ from quail.bench.quailb import (
     queries,
     run_output,
 )
-from quail.bench.substrait import AI_URN, Filter, Join, Relation, read_plan
+from quail.bench.substrait import (
+    AI_URN,
+    Filter,
+    Join,
+    Relation,
+    UnsupportedQueryError,
+    read_plan,
+)
 from quail.builtins import built_in_registry
 from quail.catalog import DocumentProvider
 from quail.execution.execute import execute_query
@@ -223,6 +230,10 @@ def test_read_plan_reads_operators_and_rejects_other_extensions():
     assert join.on == (("evidence_wiki_url", "id"),)
 
     for spec in query_specs(include_privacy=True).values():
+        if spec._info.classifies:
+            with pytest.raises(UnsupportedQueryError, match="AI.CLASSIFY"):
+                read_plan(spec.plan)
+            continue
         plan = read_plan(spec.plan)
         assert len(plan.relations) == len(plan.joins) + 1, spec.id
         ids = [op.id for op in plan.operators]
